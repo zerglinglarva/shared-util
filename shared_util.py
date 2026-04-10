@@ -14,7 +14,10 @@ from pathlib import PurePath
 
 import polars as pl
 from filelock import FileLock
-from matplotlib.figure import Figure as MplFigure  # noqa: F401
+from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+
 
 #################################################################################################
 # Parse command line arguments (or use defaults in interactive mode), validate all inputs,
@@ -304,6 +307,50 @@ def lazy_parquet(
 
     return concatenated_df
 
+#################################################################################################
+# Chart helper — eliminates repeated boilerplate across all 8 time-series plots.
+def plot_time_series(
+    data_series: list[tuple[pl.Series, pl.Series, str]],
+    title: str,
+    y_format: str = "{x:.3f}",
+) -> Figure:
+    """Plot one or more (dates, values, label) series on a single axis.
+
+    Parameters
+    ----------
+    data_series : list of (dates, values, label) tuples
+    title : chart title
+    y_format : format string for y-axis ticks (use ``{x}`` as placeholder).
+        Examples: ``"{x:.3f}"``, ``"{x:.1f}K"`` (caller must pre-scale),
+        ``"{x:.1f}B"`` (caller must pre-scale).
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(18, 6))
+
+    for dates, values, label in data_series:
+        ax.plot(dates, values, label=label)
+
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Value")
+    ax.set_title(title)
+    ax.legend(loc="center left", bbox_to_anchor=(1.1, 0.5), borderaxespad=0.5)
+    ax.tick_params(axis="x", rotation=90)
+
+    formatter = mtick.FuncFormatter(
+        lambda x, _pos: y_format.format(x=x, x_k=x / 1e3, x_b=x / 1e9)
+    )
+    ax.yaxis.set_major_formatter(formatter)
+
+    # Mirror labels on right y-axis for readability
+    ax_right = ax.twinx()
+    ax_right.yaxis.set_major_formatter(formatter)
+    ax_right.set_ylim(ax.get_ylim())
+
+    plt.subplots_adjust(right=0.6)
+    plt.show()
+    plt.close()
+    return fig
+
+
 
 #################################################################################################
 # function to create and save multiple matplotlib charts as embedded images in a single html file
@@ -314,7 +361,7 @@ def save_matplotlib_charts_as_html(
     write_directory: str,
     subfolder: str,
     file_name_prefix: str,
-    figures: list[MplFigure],
+    figures: list[Figure],
 ) -> str:
     """Save pre-built matplotlib figures as embedded images in a single HTML file.
 
@@ -334,7 +381,7 @@ def save_matplotlib_charts_as_html(
         Relative subfolder within *write_directory* (created if needed).
     file_name_prefix : str
         Used for the HTML filename and page title.
-    figures : list[MplFigure]
+    figures : list[Figure]
         Already-created matplotlib Figure objects (e.g. [fig1, fig3, ...]).
 
     Returns
@@ -354,7 +401,7 @@ def save_matplotlib_charts_as_html(
     if not figures:
         raise ValueError("figures list must not be empty")
     for i, fig in enumerate(figures):
-        if not isinstance(fig, MplFigure):
+        if not isinstance(fig, Figure):
             raise TypeError(
                 f"figures[{i}] is {type(fig).__name__}, expected matplotlib Figure"
             )

@@ -308,7 +308,7 @@ def lazy_parquet(
     return concatenated_df
 
 #################################################################################################
-# Chart helper — eliminates repeated boilerplate across all 8 time-series plots.
+# Chart helper — eliminates repeated boilerplate for plotting time series with consistent formatting and robust Windows NAS path handling.
 def plot_time_series(
     data_series: list[tuple[pl.Series, pl.Series, str]],
     title: str,
@@ -336,7 +336,7 @@ def plot_time_series(
     ax.tick_params(axis="x", rotation=90)
 
     formatter = mtick.FuncFormatter(
-        lambda x, _pos: y_format.format(x=x, x_k=x / 1e3, x_b=x / 1e9)
+        lambda x, _pos: y_format.format(x=x, x_k=x / 1e3, x_m=x / 1e6, x_b=x / 1e9)
     )
     ax.yaxis.set_major_formatter(formatter)
 
@@ -433,10 +433,14 @@ def save_matplotlib_charts_as_html(
             f"subfolder must contain at least one non-empty path component: {subfolder!r}"
         )
 
+    # Explicit check for both separators rather than os.path.basename(), which
+    # only treats "\" as a separator on Windows.  This ensures identical
+    # validation behaviour on both Windows and Linux.
     if (
         not file_name_prefix
         or file_name_prefix != file_name_prefix.strip()
-        or os.path.basename(file_name_prefix) != file_name_prefix
+        or "/" in file_name_prefix
+        or "\\" in file_name_prefix
     ):
         raise ValueError(
             "file_name_prefix must not be empty, cannot have leading/trailing "
@@ -515,6 +519,7 @@ def save_matplotlib_charts_as_html(
                 fd = os.open(
                     tmp_path,
                     os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+                    0o666,
                 )
                 try:
                     # os.write may return fewer bytes than requested (POSIX spec).
@@ -623,7 +628,7 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
         probe_path = os.path.join(folder_path, f".time_probe_{uuid.uuid4().hex}")
         probe_created = False
         try:
-            fd = os.open(probe_path, os.O_CREAT | os.O_WRONLY)
+            fd = os.open(probe_path, os.O_CREAT | os.O_WRONLY, 0o666)
             probe_created = True
             try:
                 server_now = os.fstat(fd).st_mtime
@@ -739,10 +744,14 @@ def _validate_inputs(
         )
 
     # --- file_name_prefix: no whitespace, no separators, no illegal chars ---
+    # Explicit check for both separators rather than os.path.basename(), which
+    # only treats "\" as a separator on Windows.  This ensures identical
+    # validation behaviour on both Windows and Linux.
     if (
         not file_name_prefix
         or file_name_prefix != file_name_prefix.strip()
-        or os.path.basename(file_name_prefix) != file_name_prefix
+        or "/" in file_name_prefix
+        or "\\" in file_name_prefix
     ):
         raise ValueError(
             "file_name_prefix must not be empty, cannot have leading/trailing whitespace, and cannot contain path separators"
@@ -771,9 +780,12 @@ def _resolve_folder_path(write_directory: str, subfolder: str) -> str:
     """
     base_dir = os.path.realpath(write_directory)
 
-    # Strip leading slashes so os.path.join treats subfolder as relative,
+    # Normalize backslashes to forward slashes so that subfolder paths like
+    # "data\output" are treated identically on both Windows (where \ is a
+    # path separator) and Linux (where \ is a literal filename character).
+    # Then strip leading slashes so os.path.join treats it as relative,
     # not as an absolute path that would silently override base_dir.
-    subfolder_safe = subfolder.lstrip("\\/")
+    subfolder_safe = subfolder.replace("\\", "/").lstrip("/")
     if not subfolder_safe:
         raise ValueError(
             f"subfolder resolves to empty after stripping leading slashes: {subfolder!r}"
@@ -1107,8 +1119,8 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
             os.replace(tmp_path, file_path)
             return
         except OSError as e:
-            win_err = getattr(e, "winerror", 0)
-            posix_err = getattr(e, "errno", 0)
+            win_err = getattr(e, "winerror", None)
+            posix_err = getattr(e, "errno", None)
             if win_err not in (5, 32, 33) and posix_err not in (
                 errno.EACCES,
                 errno.EBUSY,

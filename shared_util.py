@@ -313,12 +313,22 @@ def lazy_parquet(
 def winsorized_rolling_stats(
     df: pl.DataFrame,
     index_col: str,
-    window: str,
     val_col: str,
     group_by: str | None = None,
+    *,
+    window: str | None = None,
+    window_size: int | None = None,
+    min_samples: int = 1,
 ) -> pl.DataFrame:
     """
-    Time-based rolling 1-obs winsorized mean and sample stdev (ddof=1).
+    Rolling 1-obs winsorized mean and sample stdev (ddof=1).
+
+    Exactly one of ``window`` (time/integer duration string, e.g. ``"73d"``,
+    ``"10i"``) or ``window_size`` (count-based, trailing N rows per group)
+    must be provided. ``min_samples`` (default 1) nulls out outputs where
+    the window contains fewer than that many non-null finite observations —
+    use this to align the winsorized pipeline with a count-based
+    ``rolling_*(window_size=N, min_samples=M)`` elsewhere.
 
     For each window: sort, replace min with 2nd-min and max with 2nd-max, then
     compute mean/std. Derives both from sum/sum-of-squares of the sorted list
@@ -376,7 +386,6 @@ def winsorized_rolling_stats(
     for arg_name, arg_val in (
         ("index_col", index_col),
         ("val_col", val_col),
-        ("window", window),
     ):
         if not isinstance(arg_val, str) or not arg_val:
             raise TypeError(
@@ -385,6 +394,31 @@ def winsorized_rolling_stats(
     if group_by is not None and (not isinstance(group_by, str) or not group_by):
         raise TypeError(
             f"group_by must be None or a non-empty string, got {group_by!r}"
+        )
+
+    # Exactly one of window / window_size must be provided.
+    if (window is None) == (window_size is None):
+        raise ValueError(
+            "exactly one of window (duration string) or window_size "
+            "(positive int, count-based) must be provided; got "
+            f"window={window!r}, window_size={window_size!r}"
+        )
+    if window is not None and (not isinstance(window, str) or not window):
+        raise TypeError(
+            f"window must be a non-empty string, got {window!r}"
+        )
+    if window_size is not None:
+        if not isinstance(window_size, int) or isinstance(window_size, bool) or window_size <= 0:
+            raise ValueError(
+                f"window_size must be a positive int, got {window_size!r}"
+            )
+    if not isinstance(min_samples, int) or isinstance(min_samples, bool) or min_samples < 1:
+        raise ValueError(
+            f"min_samples must be a positive int, got {min_samples!r}"
+        )
+    if window_size is not None and min_samples > window_size:
+        raise ValueError(
+            f"min_samples ({min_samples}) must be <= window_size ({window_size})"
         )
 
     required_cols = [index_col, val_col] + ([group_by] if group_by else [])
@@ -432,36 +466,37 @@ def winsorized_rolling_stats(
     # the index dtype. Polars accepts compound durations like "1d12h", plus
     # the integer-index unit "i". Catching the malformed/mismatched cases
     # here turns opaque mid-plan parse errors into actionable messages.
-    _units_re = re.compile(r"(ns|us|ms|mo|[smhdwqyi])")
-    _window_components_re = re.compile(r"(\d+)(ns|us|ms|mo|[smhdwqyi])")
-    if not re.fullmatch(r"(\d+(ns|us|ms|mo|[smhdwqyi]))+", window):
-        raise ValueError(
-            f"window {window!r} is not a valid polars duration string; "
-            f"expected e.g. '30s', '5m', '1d', '1mo', '10i' (or compound "
-            f"forms like '1d12h')"
-        )
-    # Zero-magnitude windows ("0s", "0i", "0d0h") trigger a deep polars
-    # "window must be positive" error; catch it here.
-    if all(int(mag) == 0 for mag, _ in _window_components_re.findall(window)):
-        raise ValueError(
-            f"window {window!r} has zero total magnitude; rolling windows "
-            f"must be strictly positive"
-        )
-    window_units = _units_re.findall(window)
-    if idx_dtype.is_integer():
-        if any(u != "i" for u in window_units):
+    if window is not None:
+        _units_re = re.compile(r"(ns|us|ms|mo|[smhdwqyi])")
+        _window_components_re = re.compile(r"(\d+)(ns|us|ms|mo|[smhdwqyi])")
+        if not re.fullmatch(r"(\d+(ns|us|ms|mo|[smhdwqyi]))+", window):
             raise ValueError(
-                f"window {window!r} uses temporal units but index_col "
-                f"{index_col!r} is integer ({idx_dtype}); use an "
-                f"'i'-suffixed window like '10i'"
+                f"window {window!r} is not a valid polars duration string; "
+                f"expected e.g. '30s', '5m', '1d', '1mo', '10i' (or compound "
+                f"forms like '1d12h')"
             )
-    else:
-        if "i" in window_units:
+        # Zero-magnitude windows ("0s", "0i", "0d0h") trigger a deep polars
+        # "window must be positive" error; catch it here.
+        if all(int(mag) == 0 for mag, _ in _window_components_re.findall(window)):
             raise ValueError(
-                f"window {window!r} uses the integer unit 'i' but index_col "
-                f"{index_col!r} is temporal ({idx_dtype}); use duration "
-                f"units like 's', 'm', 'h', 'd', 'mo'"
+                f"window {window!r} has zero total magnitude; rolling windows "
+                f"must be strictly positive"
             )
+        window_units = _units_re.findall(window)
+        if idx_dtype.is_integer():
+            if any(u != "i" for u in window_units):
+                raise ValueError(
+                    f"window {window!r} uses temporal units but index_col "
+                    f"{index_col!r} is integer ({idx_dtype}); use an "
+                    f"'i'-suffixed window like '10i'"
+                )
+        else:
+            if "i" in window_units:
+                raise ValueError(
+                    f"window {window!r} uses the integer unit 'i' but index_col "
+                    f"{index_col!r} is temporal ({idx_dtype}); use duration "
+                    f"units like 's', 'm', 'h', 'd', 'mo'"
+                )
 
     # group_by column dtype must be groupable; nested/object dtypes cause
     # polars to error inside rolling() with an opaque message.
@@ -540,14 +575,19 @@ def winsorized_rolling_stats(
 
     # Gate every branch on the minimum n required so disallowed sizes hit
     # `otherwise(None)` instead of computing 0/0 (NaN) or a degenerate value.
+    # min_samples raises the floor on top of the intrinsic per-branch minima
+    # (3 for winsorized, 1/2 for the small-window fallbacks).
+    gate_big = max(3, min_samples)
+    gate_mean_small = max(1, min_samples)
+    gate_std_small = max(2, min_samples)
     mean_expr = (
-        pl.when(n >= 3).then(mean_big)
-        .when(n >= 1).then(mean_small)
+        pl.when(n >= gate_big).then(mean_big)
+        .when(n >= gate_mean_small).then(mean_small)
         .otherwise(None)
     )
     std_expr = (
-        pl.when(n >= 3).then(var_big.sqrt())
-        .when(n >= 2).then(var_small.sqrt())
+        pl.when(n >= gate_big).then(var_big.sqrt())
+        .when(n >= gate_std_small).then(var_small.sqrt())
         .otherwise(None)
     )
 
@@ -580,8 +620,22 @@ def winsorized_rolling_stats(
         # rolling().agg() only preserves index_col + group_by + agg columns
         # anyway, so output semantics are identical.
         df = df.select([*sort_keys, val_col]).sort(sort_keys)
+        row_idx_c = f"{tag}_rowidx"
+        if window_size is not None:
+            # Count-based: build a per-group contiguous integer row index
+            # (global `with_row_index` after sort gives each group a
+            # contiguous monotonic range, which is what polars rolling
+            # requires as its index column). We rejoin the agg output on
+            # this index so the original index_col is preserved unchanged.
+            df = df.with_row_index(name=row_idx_c)
+            rolling_period: str = f"{window_size}i"
+            rolling_index = row_idx_c
+        else:
+            assert window is not None  # validated above
+            rolling_period = window
+            rolling_index = index_col
         result = (
-            df.rolling(index_column=index_col, period=window, group_by=group_by)
+            df.rolling(index_column=rolling_index, period=rolling_period, group_by=group_by)
             .agg(**{
                 sorted_c: val_expr.drop_nulls().sort(),
                 sum_c: val_expr.sum(),
@@ -594,6 +648,14 @@ def winsorized_rolling_stats(
             )
             .drop([sorted_c, len_c, sum_c, ss_c])
         )
+        if window_size is not None:
+            # Rejoin the preserved index_col from the sorted input frame
+            # via the row-index key, then drop the synthetic index.
+            result = (
+                result
+                .join(df.select(row_idx_c, index_col), on=row_idx_c, how="left")
+                .drop(row_idx_c)
+            )
     except Exception as e:
         raise RuntimeError(
             f"winsorized_rolling_stats: polars rolling pipeline failed "

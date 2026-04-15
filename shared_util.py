@@ -307,6 +307,58 @@ def lazy_parquet(
 
     return concatenated_df
 
+
+###################################################################################################
+# Define a function to compute rolling winsorized statistics
+def winsorized_rolling_stats(
+    df: pl.DataFrame,
+    index_col: str,
+    window: str,
+    val_col: str,
+    group_by: str | None = None,
+) -> pl.DataFrame:
+    """
+    Time-based rolling 1-obs winsorized mean and sample stdev (ddof=1).
+
+    For each window: sort, replace min with 2nd-min and max with 2nd-max, then
+    compute mean/std. Derives both from sum/sum-of-squares of the sorted list
+    with a rank-1 tail substitution, avoiding per-row list materialization.
+    For len < 3 the original values are passed through unchanged.
+    """
+    # Shorthand Expressions
+    s = pl.col("_sorted")
+    n = pl.col("_len")
+    raw_sum = pl.col("_sum")
+    raw_ss = pl.col("_ss")
+
+    # Get the 1st and 2nd lowest and highest values, with nulls for out-of-bounds   
+    lo, lo2 = s.list.get(0, null_on_oob=True), s.list.get(1, null_on_oob=True)
+    hi, hi2 = s.list.get(-1, null_on_oob=True), s.list.get(-2, null_on_oob=True)
+
+    w_sum = raw_sum - lo - hi + lo2 + hi2
+    w_ss = raw_ss - lo * lo - hi * hi + lo2 * lo2 + hi2 * hi2
+
+    mean_big = w_sum / n
+    var_big = (w_ss - n * mean_big * mean_big) / (n - 1)
+
+    mean_small = raw_sum / n
+    var_small = pl.when(n >= 2).then((raw_ss - n * mean_small * mean_small) / (n - 1)).otherwise(None)
+
+    return (
+        df.rolling(index_column=index_col, period=window, group_by=group_by)
+        .agg(
+            _sorted=pl.col(val_col).drop_nulls().sort(),
+            _sum=pl.col(val_col).sum(),
+            _ss=(pl.col(val_col) * pl.col(val_col)).sum(),
+        )
+        .with_columns(_len=pl.col("_sorted").list.len())
+        .with_columns(
+            winsorized_mean=pl.when(n >= 3).then(mean_big).otherwise(mean_small),
+            winsorized_std=pl.when(n >= 3).then(var_big.sqrt()).otherwise(var_small.sqrt()),
+        )
+        .drop(["_sorted", "_len", "_sum", "_ss"])
+    )
+
 #################################################################################################
 # Chart helper — eliminates repeated boilerplate for plotting time series with consistent formatting and robust Windows NAS path handling.
 def plot_time_series(

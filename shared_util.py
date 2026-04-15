@@ -323,15 +323,207 @@ def winsorized_rolling_stats(
     For each window: sort, replace min with 2nd-min and max with 2nd-max, then
     compute mean/std. Derives both from sum/sum-of-squares of the sorted list
     with a rank-1 tail substitution, avoiding per-row list materialization.
-    For len < 3 the original values are passed through unchanged.
-    """
-    # Shorthand Expressions
-    s = pl.col("_sorted")
-    n = pl.col("_len")
-    raw_sum = pl.col("_sum")
-    raw_ss = pl.col("_ss")
 
-    # Get the 1st and 2nd lowest and highest values, with nulls for out-of-bounds   
+    Small-window behavior (no winsorization applied — not enough data to
+    meaningfully trim extremes):
+      * n == 0 : winsorized_mean = None, winsorized_std = None
+      * n == 1 : winsorized_mean = the single value, winsorized_std = None
+      * n == 2 : winsorized_mean = arithmetic mean of the two values,
+                 winsorized_std = sample std of the two values
+      * n >= 3 : full winsorization applied
+
+    "n" here counts non-null finite values per window (nulls, NaN, and ±Inf
+    are neutralized to null before aggregation).
+
+    Outputs are always numeric-or-None: NaN and ±Inf are mapped to None.
+    Defenses: explicit None for empty windows (avoid 0/0), variance clamped
+    to >= 0 before sqrt (avoid NaN from floating-point cancellation on
+    near-constant windows), and a final is_finite guard for overflow or
+    Inf/NaN leaking in from the input column.
+
+    Raises
+    ------
+    TypeError
+        * df is not a polars.DataFrame
+        * index_col / val_col / window is not a non-empty string
+        * group_by is neither None nor a non-empty string
+        * val_col dtype is non-numeric or Boolean
+        * index_col dtype is not Integer / Date / Datetime
+        * group_by dtype is List / Struct / Array / Object
+    ValueError
+        * a named column is missing from df
+        * index_col / val_col / group_by are not all distinct
+        * index_col contains null values
+        * window is not a valid polars duration string
+        * window magnitude is zero
+        * window unit mismatches the index_col dtype
+        * group_by contains null values
+        * index_col / group_by collide with the output column names
+    RuntimeError
+        * the polars rolling pipeline raises any other error; the original
+          exception is chained via `__cause__` and the message includes
+          the input parameters for diagnosis
+        * the pipeline returns a non-DataFrame object, output row count
+          does not match input row count, one of the expected output
+          columns is missing, or an output column has an unexpected dtype
+          (silent-corruption guards)
+    """
+    # ── Input validation at the API boundary ────────────────────────────
+    if not isinstance(df, pl.DataFrame):
+        raise TypeError(
+            f"df must be polars.DataFrame, got {type(df).__name__}"
+        )
+    for arg_name, arg_val in (
+        ("index_col", index_col),
+        ("val_col", val_col),
+        ("window", window),
+    ):
+        if not isinstance(arg_val, str) or not arg_val:
+            raise TypeError(
+                f"{arg_name} must be a non-empty string, got {arg_val!r}"
+            )
+    if group_by is not None and (not isinstance(group_by, str) or not group_by):
+        raise TypeError(
+            f"group_by must be None or a non-empty string, got {group_by!r}"
+        )
+
+    required_cols = [index_col, val_col] + ([group_by] if group_by else [])
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Column(s) not found in df: {missing}. "
+            f"Available: {df.columns}"
+        )
+
+    # Aliased column names (e.g. group_by == index_col) would make rolling()
+    # produce a duplicate-column error or silently mis-aggregate. Reject here.
+    if len(set(required_cols)) != len(required_cols):
+        raise ValueError(
+            f"index_col, val_col, and group_by must all be distinct; got "
+            f"index_col={index_col!r}, val_col={val_col!r}, "
+            f"group_by={group_by!r}"
+        )
+
+    val_dtype = df.schema[val_col]
+    if not val_dtype.is_numeric() or isinstance(val_dtype, pl.Boolean):
+        raise TypeError(
+            f"val_col {val_col!r} must be a numeric (non-Boolean) dtype, "
+            f"got {val_dtype}"
+        )
+
+    # polars.DataFrame.rolling() only supports Integer, Date, or Datetime
+    # index columns (a monotonic timeline). Time and Duration pass the
+    # general is_temporal() gate but are rejected by rolling() with an
+    # opaque error; restrict to the officially supported set up front.
+    idx_dtype = df.schema[index_col]
+    idx_ok = idx_dtype.is_integer() or isinstance(idx_dtype, (pl.Date, pl.Datetime))
+    if not idx_ok:
+        raise TypeError(
+            f"index_col {index_col!r} must be an integer, Date, or Datetime "
+            f"dtype; got {idx_dtype} (Time and Duration are not supported)"
+        )
+    if df[index_col].null_count() > 0:
+        raise ValueError(
+            f"index_col {index_col!r} contains null values; rolling windows "
+            f"require a non-null monotonic index"
+        )
+
+    # Validate the window string format, then cross-check its unit against
+    # the index dtype. Polars accepts compound durations like "1d12h", plus
+    # the integer-index unit "i". Catching the malformed/mismatched cases
+    # here turns opaque mid-plan parse errors into actionable messages.
+    _units_re = re.compile(r"(ns|us|ms|mo|[smhdwqyi])")
+    _window_components_re = re.compile(r"(\d+)(ns|us|ms|mo|[smhdwqyi])")
+    if not re.fullmatch(r"(\d+(ns|us|ms|mo|[smhdwqyi]))+", window):
+        raise ValueError(
+            f"window {window!r} is not a valid polars duration string; "
+            f"expected e.g. '30s', '5m', '1d', '1mo', '10i' (or compound "
+            f"forms like '1d12h')"
+        )
+    # Zero-magnitude windows ("0s", "0i", "0d0h") trigger a deep polars
+    # "window must be positive" error; catch it here.
+    if all(int(mag) == 0 for mag, _ in _window_components_re.findall(window)):
+        raise ValueError(
+            f"window {window!r} has zero total magnitude; rolling windows "
+            f"must be strictly positive"
+        )
+    window_units = _units_re.findall(window)
+    if idx_dtype.is_integer():
+        if any(u != "i" for u in window_units):
+            raise ValueError(
+                f"window {window!r} uses temporal units but index_col "
+                f"{index_col!r} is integer ({idx_dtype}); use an "
+                f"'i'-suffixed window like '10i'"
+            )
+    else:
+        if "i" in window_units:
+            raise ValueError(
+                f"window {window!r} uses the integer unit 'i' but index_col "
+                f"{index_col!r} is temporal ({idx_dtype}); use duration "
+                f"units like 's', 'm', 'h', 'd', 'mo'"
+            )
+
+    # group_by column dtype must be groupable; nested/object dtypes cause
+    # polars to error inside rolling() with an opaque message.
+    if group_by is not None:
+        gb_dtype = df.schema[group_by]
+        if isinstance(gb_dtype, (pl.List, pl.Struct, pl.Array, pl.Object)):
+            raise TypeError(
+                f"group_by {group_by!r} has dtype {gb_dtype}, which is not "
+                f"groupable; use a scalar dtype (Int/Utf8/Categorical/Date/…)"
+            )
+        # Polars silently lumps all null group keys together, which is
+        # almost never what the caller wants; fail loudly instead.
+        if df[group_by].null_count() > 0:
+            raise ValueError(
+                f"group_by {group_by!r} contains null values; drop or fill "
+                f"them before calling (polars would otherwise group all "
+                f"nulls into a single bucket)"
+            )
+
+    # Output-column collision: rolling().agg() preserves index_col and
+    # group_by in the output. If either is named "winsorized_mean" or
+    # "winsorized_std", the final with_columns() would silently overwrite
+    # it — a genuine silent-corruption risk. Reject up front.
+    _output_cols = {"winsorized_mean", "winsorized_std"}
+    _reserved_conflict = _output_cols.intersection(
+        {index_col, group_by} - {None}
+    )
+    if _reserved_conflict:
+        raise ValueError(
+            f"index_col/group_by cannot be named {sorted(_reserved_conflict)!r}; "
+            f"those names are reserved for this function's output columns"
+        )
+
+    # Collision-proof internal column names — a caller's df may already
+    # have a column literally called "_sorted", "_sum", etc.
+    tag = f"__wrs_{uuid.uuid4().hex[:8]}"
+    sorted_c, sum_c, ss_c, len_c = (
+        f"{tag}_sorted", f"{tag}_sum", f"{tag}_ss", f"{tag}_len",
+    )
+
+    # Cast val_col to Float64 up-front, then neutralize non-finite inputs:
+    #   * Float64 avoids silent integer overflow in x*x / sum-of-squares
+    #   * mapping ±Inf/NaN to null keeps them out of min/max, which would
+    #     otherwise make a single infinity contaminate w_sum / w_ss via
+    #     Inf - Inf = NaN and mask the entire window's output as None.
+    #   * a null row stays excluded by drop_nulls() and by sum()'s null-skip
+    #     semantics, so the rest of the window still produces valid stats.
+    _raw = pl.col(val_col).cast(pl.Float64, strict=True)
+    val_expr = pl.when(_raw.is_finite()).then(_raw).otherwise(None)
+
+    # rolling() requires the frame to be monotonic by (group_by, index_col);
+    # the defensive sort happens inside the try/except below so any failure
+    # (sort comparison panic, etc.) is surfaced with input-parameter context.
+    sort_keys = [group_by, index_col] if group_by else [index_col]
+
+    # Shorthand Expressions
+    s = pl.col(sorted_c)
+    n = pl.col(len_c)
+    raw_sum = pl.col(sum_c)
+    raw_ss = pl.col(ss_c)
+
+    # Get the 1st and 2nd lowest and highest values, with nulls for out-of-bounds
     lo, lo2 = s.list.get(0, null_on_oob=True), s.list.get(1, null_on_oob=True)
     hi, hi2 = s.list.get(-1, null_on_oob=True), s.list.get(-2, null_on_oob=True)
 
@@ -339,25 +531,130 @@ def winsorized_rolling_stats(
     w_ss = raw_ss - lo * lo - hi * hi + lo2 * lo2 + hi2 * hi2
 
     mean_big = w_sum / n
-    var_big = (w_ss - n * mean_big * mean_big) / (n - 1)
+    # Clamp at 0 before sqrt: catastrophic cancellation on near-constant
+    # windows can make the numerator a tiny negative, which sqrt turns to NaN.
+    var_big = ((w_ss - n * mean_big * mean_big) / (n - 1)).clip(lower_bound=0)
 
     mean_small = raw_sum / n
-    var_small = pl.when(n >= 2).then((raw_ss - n * mean_small * mean_small) / (n - 1)).otherwise(None)
+    var_small = ((raw_ss - n * mean_small * mean_small) / (n - 1)).clip(lower_bound=0)
 
-    return (
-        df.rolling(index_column=index_col, period=window, group_by=group_by)
-        .agg(
-            _sorted=pl.col(val_col).drop_nulls().sort(),
-            _sum=pl.col(val_col).sum(),
-            _ss=(pl.col(val_col) * pl.col(val_col)).sum(),
-        )
-        .with_columns(_len=pl.col("_sorted").list.len())
-        .with_columns(
-            winsorized_mean=pl.when(n >= 3).then(mean_big).otherwise(mean_small),
-            winsorized_std=pl.when(n >= 3).then(var_big.sqrt()).otherwise(var_small.sqrt()),
-        )
-        .drop(["_sorted", "_len", "_sum", "_ss"])
+    # Gate every branch on the minimum n required so disallowed sizes hit
+    # `otherwise(None)` instead of computing 0/0 (NaN) or a degenerate value.
+    mean_expr = (
+        pl.when(n >= 3).then(mean_big)
+        .when(n >= 1).then(mean_small)
+        .otherwise(None)
     )
+    std_expr = (
+        pl.when(n >= 3).then(var_big.sqrt())
+        .when(n >= 2).then(var_small.sqrt())
+        .otherwise(None)
+    )
+
+    # Final guard: any residual NaN or ±Inf (e.g. overflow on extreme inputs,
+    # or non-finite values leaking in from val_col) becomes None.
+    mean_final = pl.when(mean_expr.is_finite()).then(mean_expr).otherwise(None)
+    std_final = pl.when(std_expr.is_finite()).then(std_expr).otherwise(None)
+
+    # Capture the caller's row count BEFORE sort/rolling so the post-condition
+    # compares against the true input height. Reading df.height after the
+    # in-try reassignment would compare two equally-wrong heights if sort
+    # itself had silently dropped or duplicated rows.
+    input_height = df.height
+
+    # Wrap the polars pipeline: despite upstream validation, polars can still
+    # raise ComputeError / SchemaError / PanicException / version-specific
+    # exceptions from inside rolling/agg/with_columns. Re-raise with context
+    # so the caller sees which inputs triggered the failure rather than a
+    # deep-stack polars internal error.
+    try:
+        # Narrow df to only the columns this function actually reads before
+        # sorting. Reasons:
+        #   * The caller's df may have unrelated columns with pathological
+        #     dtypes (Object holding unhashable Python objects, Categorical
+        #     without a string cache, deeply-nested Structs) that would make
+        #     sort/rolling copy-of-all fail or panic, even though we never
+        #     use those columns.
+        #   * Halves memory overhead on wide DataFrames — sort materializes
+        #     a full copy, so narrowing first is cheaper.
+        # rolling().agg() only preserves index_col + group_by + agg columns
+        # anyway, so output semantics are identical.
+        df = df.select([*sort_keys, val_col]).sort(sort_keys)
+        result = (
+            df.rolling(index_column=index_col, period=window, group_by=group_by)
+            .agg(**{
+                sorted_c: val_expr.drop_nulls().sort(),
+                sum_c: val_expr.sum(),
+                ss_c: (val_expr * val_expr).sum(),
+            })
+            .with_columns(**{len_c: pl.col(sorted_c).list.len()})
+            .with_columns(
+                winsorized_mean=mean_final,
+                winsorized_std=std_final,
+            )
+            .drop([sorted_c, len_c, sum_c, ss_c])
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"winsorized_rolling_stats: polars rolling pipeline failed "
+            f"(index_col={index_col!r}, val_col={val_col!r}, "
+            f"window={window!r}, group_by={group_by!r}, "
+            f"n_rows={df.height}, index_dtype={idx_dtype}, "
+            f"val_dtype={val_dtype}). Underlying error: "
+            f"{type(e).__name__}: {e}"
+        ) from e
+
+    # Post-condition checks — rolling().agg() is a 1:1 row-wise operation,
+    # not a group-by collapse, so height must match input and the two named
+    # output columns must be present. Catching a mismatch turns a silent-
+    # corruption failure (joins-on-index quietly go wrong) into a clear
+    # error, and guards against future polars behavior changes.
+    #
+    # Every post-condition error includes the same input-parameter context
+    # so a caller debugging a silent-corruption path always gets the full
+    # picture regardless of which specific guard tripped.
+    _ctx = (
+        f"index_col={index_col!r}, val_col={val_col!r}, "
+        f"window={window!r}, group_by={group_by!r}, "
+        f"input_height={input_height}"
+    )
+
+    # Type post-condition: a future polars version might change rolling().agg()
+    # to return a LazyFrame (or some wrapper) — without this check, the
+    # subsequent .height access would raise a cryptic AttributeError from the
+    # post-condition code itself, masking the actual semantic change.
+    if not isinstance(result, pl.DataFrame):
+        raise RuntimeError(
+            f"winsorized_rolling_stats: expected pl.DataFrame output from "
+            f"rolling pipeline, got {type(result).__name__}; polars API may "
+            f"have changed ({_ctx})"
+        )
+    if result.height != input_height:
+        raise RuntimeError(
+            f"winsorized_rolling_stats: output row count {result.height} "
+            f"does not match input {input_height}; polars may have dropped "
+            f"or duplicated rows ({_ctx})"
+        )
+    missing_out = {"winsorized_mean", "winsorized_std"} - set(result.columns)
+    if missing_out:
+        raise RuntimeError(
+            f"winsorized_rolling_stats: output is missing expected "
+            f"column(s) {sorted(missing_out)!r}; got {result.columns} "
+            f"({_ctx})"
+        )
+    # Dtype post-condition: both stat columns must be Float64 (the cast
+    # target) or Null (only possible when result is empty and polars
+    # couldn't infer from zero rows). Anything else would silently break
+    # downstream numeric ops like .cast(Float64) / arithmetic.
+    for _out in ("winsorized_mean", "winsorized_std"):
+        _out_dtype = result.schema[_out]
+        if not isinstance(_out_dtype, (pl.Float64, pl.Null)):
+            raise RuntimeError(
+                f"winsorized_rolling_stats: output column {_out!r} has "
+                f"unexpected dtype {_out_dtype}; expected Float64 "
+                f"(or Null for an empty result) ({_ctx})"
+            )
+    return result
 
 #################################################################################################
 # Chart helper — eliminates repeated boilerplate for plotting time series with consistent formatting and robust Windows NAS path handling.

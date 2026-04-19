@@ -10,14 +10,13 @@ import sys
 import time
 import uuid
 import zoneinfo
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
 import polars as pl
 from filelock import FileLock
 from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
-
 
 #################################################################################################
 # Parse command line arguments (or use defaults in interactive mode), validate all inputs,
@@ -133,7 +132,7 @@ def parse_arguments(
     write_directory = os.path.realpath(write_directory)
 
     # Fail early if the resolved directory doesn't exist on disk
-    if not os.path.isdir(write_directory):
+    if not Path(write_directory).is_dir():
         raise FileNotFoundError(f"Write directory does not exist: {write_directory}")
 
     return startdate, enddate, write_directory
@@ -157,8 +156,9 @@ def lazy_parquet(
     # Resolve to absolute path so that scan_parquet paths remain valid
     # even if the caller changes the working directory before collect().
     folder_path = os.path.realpath(folder_path)
+    folder = Path(folder_path)
 
-    if not os.path.isdir(folder_path):
+    if not folder.is_dir():
         raise FileNotFoundError(f"Folder does not exist: {folder_path}")
 
     # Normalize datetime.datetime to datetime.date.  datetime.datetime is a
@@ -175,12 +175,26 @@ def lazy_parquet(
             f"start_date ({start_date}) must be on or before end_date ({end_date})"
         )
 
-    file_names = os.listdir(folder_path)
+    # Retry directory listing on transient NAS errors (SMB reconnect, NFS stale
+    # handle).  Matches the retry pattern of _makedirs_with_retry: 3 attempts
+    # with 0.5s / 1.0s backoff; the final attempt propagates the OSError so
+    # the caller sees a real failure rather than an opaque empty folder.
+    file_names: list[str] | None = None
+    for _listdir_attempt in range(3):
+        try:
+            file_names = [entry.name for entry in folder.iterdir()]
+            break
+        except OSError:
+            if _listdir_attempt == 2:
+                raise
+            time.sleep(0.5 * (2**_listdir_attempt))
+    assert file_names is not None  # loop exits via break or raise
+
     parquet_file_names = [
         file
         for file in file_names
         if file.lower().endswith(".parquet")
-        and os.path.isfile(os.path.join(folder_path, file))
+        and (folder / file).is_file()
     ]
 
     if not parquet_file_names:
@@ -190,7 +204,7 @@ def lazy_parquet(
     # On a shared NAS, files can vanish between listdir and schema read
     # (e.g. concurrent save_results deleting old date-range files).
     # Skip files that disappear rather than crashing with an opaque ArrowError.
-    file_paths = [os.path.join(folder_path, file) for file in parquet_file_names]
+    file_paths = [str(folder / file) for file in parquet_file_names]
     schemas: dict[str, dict[str, pl.DataType]] = {}
     for path in file_paths:
         try:
@@ -201,7 +215,7 @@ def lazy_parquet(
             # Corrupted/truncated parquet files raise ComputeError (not OSError).
             # Warn so the user knows, but don't crash the entire function
             # when other valid files exist.
-            print(f"Warning: skipping {os.path.basename(path)}: {e}")
+            print(f"Warning: skipping {Path(path).name}: {e}")
             continue
 
     # Re-filter file_paths to only those whose schema was successfully read
@@ -212,14 +226,14 @@ def lazy_parquet(
     reference_path = file_paths[0]
     reference_schema = schemas[reference_path]
 
-    ref_name = os.path.basename(reference_path)
+    ref_name = Path(reference_path).name
     ref_cols = set(reference_schema.keys())
 
     mismatches: list[str] = []
     for path, schema in schemas.items():
         if schema == reference_schema:
             continue
-        file_name = os.path.basename(path)
+        file_name = Path(path).name
         cur_cols = set(schema.keys())
 
         missing = ref_cols - cur_cols
@@ -294,8 +308,16 @@ def lazy_parquet(
                 )
             )
             dataframes.append(df)
-        except Exception:
-            continue  # File vanished or became unreadable after schema check
+        except Exception as e:
+            # File vanished or became unreadable after the schema check.
+            # Log the failure rather than silently swallowing — silent drops
+            # would hide a real bug (e.g. malformed filter expression) behind
+            # a smaller-than-expected row count at collect() time.
+            print(
+                f"Warning: skipping {Path(path).name} during scan: "
+                f"{type(e).__name__}: {e}"
+            )
+            continue
 
     if not dataframes:
         raise ValueError(
@@ -303,7 +325,11 @@ def lazy_parquet(
             f"between schema validation and scan"
         )
 
-    concatenated_df = pl.concat(dataframes)
+    # Explicit how="vertical" — pl.concat's default on LazyFrames requires
+    # matching schema AND column order.  The .select(reference_columns) above
+    # guarantees both, but being explicit makes the safety property obvious
+    # and guards against a future default change.
+    concatenated_df = pl.concat(dataframes, how="vertical")
 
     return concatenated_df
 
@@ -734,32 +760,119 @@ def plot_time_series(
     y_format : format string for y-axis ticks (use ``{x}`` as placeholder).
         Examples: ``"{x:.3f}"``, ``"{x:.1f}K"`` (caller must pre-scale),
         ``"{x:.1f}B"`` (caller must pre-scale).
+
+    Raises
+    ------
+    TypeError
+        * data_series is not a list
+        * a series element's dates / values is not a polars.Series
+        * a series element's label is not a string
+        * val_col dtype is non-numeric or Boolean
+        * title or y_format is not a string
+    ValueError
+        * data_series is empty
+        * a tuple is not length 3
+        * dates and values have different lengths
+        * a series pair is empty
+        * y_format is not a valid str.format template (e.g. unknown
+          substitution key), which would otherwise fail per-tick at render.
     """
+    # ── Input validation at the API boundary ────────────────────────────
+    if not isinstance(data_series, list):
+        raise TypeError(
+            f"data_series must be a list, got {type(data_series).__name__}"
+        )
+    if not data_series:
+        raise ValueError("data_series must not be empty")
+    if not isinstance(title, str):
+        raise TypeError(f"title must be a string, got {type(title).__name__}")
+    if not isinstance(y_format, str):
+        raise TypeError(f"y_format must be a string, got {type(y_format).__name__}")
+
+    for i, item in enumerate(data_series):
+        if not isinstance(item, tuple) or len(item) != 3:
+            got = (
+                f"tuple of length {len(item)}"
+                if isinstance(item, tuple)
+                else type(item).__name__
+            )
+            raise ValueError(
+                f"data_series[{i}] must be a 3-tuple (dates, values, label), got {got}"
+            )
+        dates, values, label = item
+        if not isinstance(dates, pl.Series):
+            raise TypeError(
+                f"data_series[{i}][0] (dates) must be a polars.Series, "
+                f"got {type(dates).__name__}"
+            )
+        if not isinstance(values, pl.Series):
+            raise TypeError(
+                f"data_series[{i}][1] (values) must be a polars.Series, "
+                f"got {type(values).__name__}"
+            )
+        if not isinstance(label, str):
+            raise TypeError(
+                f"data_series[{i}][2] (label) must be a string, "
+                f"got {type(label).__name__}"
+            )
+        if len(dates) != len(values):
+            raise ValueError(
+                f"data_series[{i}] length mismatch: dates has {len(dates)} "
+                f"elements, values has {len(values)}"
+            )
+        if len(dates) == 0:
+            raise ValueError(f"data_series[{i}] series must not be empty")
+        val_dtype = values.dtype
+        if not val_dtype.is_numeric() or isinstance(val_dtype, pl.Boolean):
+            raise TypeError(
+                f"data_series[{i}][1] (values) must have a numeric (non-Boolean) "
+                f"dtype, got {val_dtype}"
+            )
+
+    # Validate y_format before plotting. FuncFormatter would otherwise raise
+    # a KeyError per tick at render time, producing a stack of confusing
+    # matplotlib warnings instead of a single clear error.
+    try:
+        y_format.format(x=0.0, x_k=0.0, x_m=0.0, x_b=0.0)
+    except (KeyError, IndexError, ValueError) as e:
+        raise ValueError(
+            f"y_format {y_format!r} is not a valid str.format template: "
+            f"{type(e).__name__}: {e}"
+        ) from e
+
+    # ── Plot ─────────────────────────────────────────────────────────────
+    # Wrap in try/except so a mid-plot failure (e.g. from user-supplied data
+    # sneaking past validation) doesn't leak the Figure — plt tracks open
+    # figures globally, and a leaked figure can exhaust memory in long-
+    # running notebooks.
     fig, ax = plt.subplots(1, 1, figsize=(18, 6))
+    try:
+        for dates, values, label in data_series:
+            ax.plot(dates, values, label=label)
 
-    for dates, values, label in data_series:
-        ax.plot(dates, values, label=label)
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Value")
+        ax.set_title(title)
+        ax.legend(loc="center left", bbox_to_anchor=(1.1, 0.5), borderaxespad=0.5)
+        ax.tick_params(axis="x", rotation=90)
 
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Value")
-    ax.set_title(title)
-    ax.legend(loc="center left", bbox_to_anchor=(1.1, 0.5), borderaxespad=0.5)
-    ax.tick_params(axis="x", rotation=90)
+        formatter = mtick.FuncFormatter(
+            lambda x, _pos: y_format.format(x=x, x_k=x / 1e3, x_m=x / 1e6, x_b=x / 1e9)
+        )
+        ax.yaxis.set_major_formatter(formatter)
 
-    formatter = mtick.FuncFormatter(
-        lambda x, _pos: y_format.format(x=x, x_k=x / 1e3, x_m=x / 1e6, x_b=x / 1e9)
-    )
-    ax.yaxis.set_major_formatter(formatter)
+        # Mirror labels on right y-axis for readability
+        ax_right = ax.twinx()
+        ax_right.yaxis.set_major_formatter(formatter)
+        ax_right.set_ylim(ax.get_ylim())
 
-    # Mirror labels on right y-axis for readability
-    ax_right = ax.twinx()
-    ax_right.yaxis.set_major_formatter(formatter)
-    ax_right.set_ylim(ax.get_ylim())
-
-    plt.subplots_adjust(right=0.6)
-    plt.show()
-    plt.close()
-    return fig
+        plt.subplots_adjust(right=0.6)
+        plt.show()
+        plt.close()
+        return fig
+    except Exception:
+        plt.close(fig)
+        raise
 
 
 
@@ -820,7 +933,7 @@ def save_matplotlib_charts_as_html(
     # Reuse the same string-level checks that save_results applies
     if not write_directory or not write_directory.strip():
         raise ValueError("write_directory must not be empty or whitespace")
-    if not os.path.isdir(write_directory):
+    if not Path(write_directory).is_dir():
         raise ValueError(f"write_directory does not exist: {write_directory}")
 
     if not subfolder or not subfolder.strip():
@@ -872,7 +985,7 @@ def save_matplotlib_charts_as_html(
 
     # ── Step 3: Build paths and check lengths ───────────────────────────
     file_name = f"{file_name_prefix}_charts.html"
-    file_path = os.path.join(folder_path, file_name)
+    file_path = str(Path(folder_path) / file_name)
     tmp_path = f"{file_path}.{uuid.uuid4().hex[:8]}.tmp"
     _validate_path_lengths(tmp_path)
 
@@ -893,14 +1006,26 @@ def save_matplotlib_charts_as_html(
         f"{datetime.datetime.now(tz=zoneinfo.ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')} US Eastern</p>",
     ]
 
-    for fig in figures:
+    for i, fig in enumerate(figures):
         axes_list = fig.get_axes()
         raw_title = axes_list[0].get_title() if axes_list else ""
         safe_title = html.escape(raw_title)
 
         buf = io.BytesIO()
         try:
-            fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
+            try:
+                fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
+            except Exception as e:
+                # fig.savefig can fail if the figure was already closed
+                # upstream, its canvas is in a bad state, or dpi × size
+                # overflows memory.  Wrap with index + title context so the
+                # caller can identify the offending figure without digging
+                # through a raw matplotlib stack trace.
+                raise RuntimeError(
+                    f"save_matplotlib_charts_as_html: fig.savefig failed "
+                    f"for figures[{i}] (title={raw_title!r}). "
+                    f"Underlying error: {type(e).__name__}: {e}"
+                ) from e
             buf.seek(0)
             b64 = base64.b64encode(buf.read()).decode("ascii")
         finally:
@@ -913,81 +1038,27 @@ def save_matplotlib_charts_as_html(
     html_parts.append("</body></html>")
 
     # ── Step 6: Atomic write — tmp then os.replace ──────────────────────
-    # Write to a temp file, fsync, then atomically rename. Retries handle
-    # transient AV/DLP/SMB locks that can appear between file creation and
-    # fsync (same pattern as _write_and_fsync for parquet files).
+    # Write+fsync+size-verify delegated to _write_bytes_and_fsync (shared
+    # with the parquet pipeline's _write_and_fsync via _fsync_and_verify_size).
+    # That gives us the 12× fsync retry envelope against AV/DLP locks and
+    # tmp cleanup on any failure.
     html_bytes = "\n".join(html_parts).encode("utf-8")
-    expected_size = len(html_bytes)
     rename_done = False
 
     try:
-        # Write phase — retry up to 4× for transient NAS I/O errors.
-        for _write_attempt in range(4):
-            try:
-                # O_BINARY prevents \n→\r\n translation on Windows.
-                # On POSIX the constant doesn't exist (all I/O is binary),
-                # so fall back to 0 (no-op).
-                fd = os.open(
-                    tmp_path,
-                    os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_BINARY", 0),
-                    0o666,
-                )
-                try:
-                    # os.write may return fewer bytes than requested (POSIX spec).
-                    # Loop until all bytes are flushed, or raise on zero-write
-                    # (which signals disk-full or broken pipe).
-                    view = memoryview(html_bytes)
-                    written_total = 0
-                    while written_total < expected_size:
-                        written = os.write(fd, view[written_total:])
-                        if written == 0:
-                            raise OSError(
-                                f"os.write returned 0 bytes after "
-                                f"{written_total}/{expected_size} — disk may be full"
-                            )
-                        written_total += written
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                break  # Write succeeded
-            except OSError:
-                # Remove partial temp file before retrying.
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass  # File may not have been created; ignore
-                if _write_attempt == 3:
-                    raise  # Exhausted all retries
-                time.sleep(min(15.0, 1.0 * (2**_write_attempt)))
+        _write_bytes_and_fsync(html_bytes, tmp_path)
 
-        # Verify written size via fstat on an open handle (bypasses SMB cache).
-        fd = os.open(tmp_path, os.O_RDONLY)
-        try:
-            on_disk = os.fstat(fd).st_size
-        finally:
-            os.close(fd)
-        if on_disk != expected_size:
-            raise OSError(
-                f"Post-write size mismatch: expected {expected_size} bytes, "
-                f"got {on_disk} bytes for {tmp_path}"
-            )
-
-        # Rename phase — retry up to 4× for transient SMB sharing violations.
-        for _rename_attempt in range(4):
-            try:
-                os.replace(tmp_path, file_path)
-                rename_done = True
-                break
-            except OSError:
-                if _rename_attempt == 3:
-                    raise
-                time.sleep(min(15.0, 1.0 * (2**_rename_attempt)))
+        # Rename phase — delegate to _atomic_replace for 12× retry with
+        # read-only-attribute clearing.  Reuses the same tested path as the
+        # parquet pipeline rather than maintaining a parallel retry loop.
+        _atomic_replace(tmp_path, file_path)
+        rename_done = True
 
     except BaseException:
         if not rename_done:
             # Best-effort cleanup of partial temp file
             try:
-                os.remove(tmp_path)
+                Path(tmp_path).unlink()
             except OSError:
                 pass  # Temp file may not exist if os.open failed
         raise
@@ -1032,11 +1103,12 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
     This function is intentionally best-effort: all errors are silently suppressed
     so that a cleanup failure never blocks the main write operation.
     """
+    folder = Path(folder_path)
     try:
         # --- Determine the server's current time via a disposable probe file ---
         # Why: Client and NAS clocks can differ by minutes. Using the server's
         # own mtime avoids deleting files that only *appear* old due to drift.
-        probe_path = os.path.join(folder_path, f".time_probe_{uuid.uuid4().hex}")
+        probe_path = str(folder / f".time_probe_{uuid.uuid4().hex}")
         probe_created = False
         try:
             fd = os.open(probe_path, os.O_CREAT | os.O_WRONLY, 0o666)
@@ -1055,12 +1127,13 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
             # are cleaned up below as part of the regular stale-file sweep.
             if probe_created:
                 try:
-                    os.remove(probe_path)
+                    Path(probe_path).unlink()
                 except OSError:
                     pass
 
         # --- Sweep the folder for stale temp files and orphaned time probes ---
-        for f in os.listdir(folder_path):
+        for entry in folder.iterdir():
+            f = entry.name
             # Only touch files belonging to our pipeline.  .lock files are left
             # alone because OS-level byte locks are automatically released when
             # the owning process exits or the SMB session drops.
@@ -1096,10 +1169,9 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
             if not (is_stale_tmp or is_orphaned_probe):
                 continue
 
-            fpath = os.path.join(folder_path, f)
             try:
-                if server_now - os.path.getmtime(fpath) > max_age_seconds:
-                    os.remove(fpath)
+                if server_now - entry.stat().st_mtime > max_age_seconds:
+                    entry.unlink()
             except OSError:
                 pass  # File may have been removed by another process; ignore
     except OSError:
@@ -1129,7 +1201,7 @@ def _validate_inputs(
     # --- write_directory: must exist on disk right now ---
     if not write_directory or not write_directory.strip():
         raise ValueError("write_directory must not be empty or whitespace")
-    if not os.path.isdir(write_directory):
+    if not Path(write_directory).is_dir():
         raise ValueError(f"write_directory does not exist: {write_directory}")
 
     # --- subfolder: no whitespace padding, no illegal chars per component ---
@@ -1201,7 +1273,7 @@ def _resolve_folder_path(write_directory: str, subfolder: str) -> str:
         raise ValueError(
             f"subfolder resolves to empty after stripping leading slashes: {subfolder!r}"
         )
-    folder_path = os.path.realpath(os.path.join(base_dir, subfolder_safe))
+    folder_path = os.path.realpath(str(Path(base_dir) / subfolder_safe))
 
     # Traversal check: the resolved folder must be inside (or equal to) base_dir.
     # normcase ensures case-insensitive comparison on Windows (C:\Foo == c:\foo).
@@ -1249,7 +1321,11 @@ def _build_filename(
         if hasattr(col_dtype, "base_type"):
             base_dtype = col_dtype.base_type()
         else:
-            base_dtype = col_dtype if isinstance(col_dtype, type) else type(col_dtype)
+            # Older polars without base_type: col_dtype may be a class (pl.Date)
+            # or an instance (Datetime("us")).  Both branches resolve to
+            # type[pl.DataType] at runtime, but mypy can't unify the ternary
+            # against the base_type() branch above — hence the targeted ignore.
+            base_dtype = col_dtype if isinstance(col_dtype, type) else type(col_dtype)  # type: ignore[assignment]
         if base_dtype not in (pl.Date, pl.Datetime):
             raise TypeError(
                 f"Column '{sort_by_date_column}' expected Date or Datetime, got {col_dtype}"
@@ -1326,8 +1402,10 @@ def _remove_duplicates(
       - All errors are suppressed per-file so one stuck file doesn't prevent
         cleanup of the others.
     """
+    folder = Path(folder_path)
     try:
-        for f in os.listdir(folder_path):
+        for entry in folder.iterdir():
+            f = entry.name
             # Skip the file we just wrote (case-sensitive), and non-parquet files
             if f == file_name or not f.lower().endswith(".parquet"):
                 continue
@@ -1344,22 +1422,18 @@ def _remove_duplicates(
                 is_dup = dup_pattern is not None and bool(dup_pattern.match(fl))
 
             if is_dup:
-                dup_path = os.path.join(folder_path, f)
                 try:
                     # On case-insensitive filesystems (NTFS, SMB), the same physical
                     # file can appear with different casing.  We MUST detect this and
                     # skip deletion to avoid destroying our own output.  The check
-                    # uses samefile (inode identity) when available, falling back to
-                    # case-insensitive name comparison if samefile is absent or fails
-                    # on network paths lacking GetFileInformationByHandle support.
+                    # uses Path.samefile (inode identity) when it doesn't fail on
+                    # network paths lacking GetFileInformationByHandle support,
+                    # falling back to case-insensitive name comparison otherwise.
                     is_same_file = False
-                    if os.path.exists(dup_path):
-                        if hasattr(os.path, "samefile"):
-                            try:
-                                is_same_file = os.path.samefile(dup_path, file_path)
-                            except OSError:
-                                is_same_file = fl == file_name.lower()
-                        else:
+                    if entry.exists():
+                        try:
+                            is_same_file = entry.samefile(file_path)
+                        except OSError:
                             is_same_file = fl == file_name.lower()
                     if is_same_file:
                         continue  # Same file — do not delete our own output
@@ -1367,17 +1441,17 @@ def _remove_duplicates(
                     # Isilon backup/compliance tools may set this flag on
                     # both Windows (NTFS) and Linux (NFS/SMB).
                     try:
-                        dattrs = os.stat(dup_path).st_mode
+                        dattrs = entry.stat().st_mode
                         if not (dattrs & stat.S_IWRITE):
-                            os.chmod(dup_path, dattrs | stat.S_IWRITE)
+                            entry.chmod(dattrs | stat.S_IWRITE)
                     except OSError:
-                        pass  # If we can't clear it, os.remove below will fail (caught)
-                    os.remove(dup_path)
+                        pass  # If we can't clear it, unlink below will fail (caught)
+                    entry.unlink()
                     print(f"Erased duplicate: {f}")
                 except OSError:
                     pass  # File may be in use by a reader or locked by AV; skip it
     except OSError as e:
-        # os.listdir itself can fail on a network path; warn but don't crash
+        # Directory iteration itself can fail on a network path; warn but don't crash
         print(f"Warning: Could not complete duplicate cleanup in {folder_path}: {e}")
 
 
@@ -1391,7 +1465,7 @@ def _validate_path_lengths(tmp_path: str) -> None:
       - Windows 260-character MAX_PATH limit (unless \\\\?\\ extended path prefix).
     """
     _MAX_BASENAME_BYTES = 255
-    tmp_basename_bytes = len(os.path.basename(tmp_path).encode("utf-8"))
+    tmp_basename_bytes = len(Path(tmp_path).name.encode("utf-8"))
     if tmp_basename_bytes > _MAX_BASENAME_BYTES:
         raise ValueError(
             f"Generated filename exceeds {_MAX_BASENAME_BYTES}-byte POSIX limit: "
@@ -1410,19 +1484,122 @@ def _validate_path_lengths(tmp_path: str) -> None:
 
 
 def _makedirs_with_retry(folder_path: str) -> None:
-    """Create the target folder, retrying up to 3× for transient NAS errors.
+    """Create the target folder, retrying up to 12× for transient NAS errors.
 
-    Uses exponential backoff (0.5s, 1.0s) between retries.  The final
-    attempt lets the OSError propagate so the caller sees the real failure.
+    Uses exponential backoff (0.5s … 15s cap) between retries — matches the
+    envelope of _atomic_replace and _write_and_fsync's fsync phase.  Filters
+    on the same transient errno set as _atomic_replace: permission and
+    sharing violations retry; path-shape errors (ENOTDIR, ENOENT, etc.) fail
+    fast so a misconfigured path doesn't stall the pipeline for ~100s.  The
+    final attempt lets the OSError propagate so the caller sees the real
+    failure.
     """
-    for _mkdir_attempt in range(3):
+    if not isinstance(folder_path, str):
+        raise TypeError(
+            f"folder_path must be a string, got {type(folder_path).__name__}"
+        )
+    if not folder_path.strip():
+        raise ValueError("folder_path must not be empty or whitespace")
+
+    for _mkdir_attempt in range(12):
         try:
-            os.makedirs(folder_path, exist_ok=True)
+            Path(folder_path).mkdir(parents=True, exist_ok=True)
             return
-        except OSError:
-            if _mkdir_attempt == 2:
+        except OSError as e:
+            win_err = getattr(e, "winerror", 0)
+            posix_err = getattr(e, "errno", 0)
+            if win_err not in (5, 32, 33) and posix_err not in (
+                errno.EACCES,
+                errno.EBUSY,
+                errno.EAGAIN,
+                _ESTALE,
+                _ETXTBSY,
+            ):
+                raise  # Not a transient NAS/permission error — fail fast
+            if _mkdir_attempt == 11:
+                raise  # Exhausted all retries
+            time.sleep(min(15.0, 0.5 * (2**_mkdir_attempt)))  # Backoff: 0.5s … 15s cap
+
+
+def _fsync_and_verify_size(tmp_path: str) -> int:
+    """Re-open tmp_path with O_RDWR, fsync, return file size via os.fstat.
+
+    Shared fsync path for _write_and_fsync (parquet) and _write_bytes_and_fsync
+    (HTML, other byte buffers).  Keeps the 12× retry envelope and read-only
+    attribute clearing in one place.
+
+    Uses os.fstat on the open handle to bypass the SMB directory metadata cache
+    (the cache can return stale sizes for FileInfoCacheLifetime seconds — 10s
+    default, up to 60s on Isilon).
+
+    Retries up to 12× with 0.5s → 15s backoff for transient AV/DLP/SMB locks
+    (WinError 5/32/33, EACCES/EBUSY/EAGAIN/ESTALE/ETXTBSY).  On any failure
+    (non-transient errno, retry exhaustion, or zero-byte result), the partial
+    tmp file is removed before propagating so the caller never sees a stale
+    artifact.
+
+    Returns the verified size in bytes.
+
+    Raises
+    ------
+    OSError
+        * fsync fails with a non-transient errno
+        * fsync fails 12× consecutively with a transient errno
+        * fstat reports zero bytes (disk full / truncation / fsync lie)
+    """
+    tmp_size = -1
+    for _fsync_attempt in range(12):
+        try:
+            fd = os.open(tmp_path, os.O_RDWR)
+            try:
+                os.fsync(fd)
+                tmp_size = os.fstat(fd).st_size
+            finally:
+                os.close(fd)
+            break  # fsync succeeded
+        except OSError as e:
+            win_err = getattr(e, "winerror", 0)
+            posix_err = getattr(e, "errno", 0)
+            # Clear read-only attribute if a NAS compliance/DLP tool set it.
+            if win_err == 5 or posix_err == errno.EACCES:
+                try:
+                    tmp_p = Path(tmp_path)
+                    attrs = tmp_p.stat().st_mode
+                    if not (attrs & stat.S_IWRITE):
+                        tmp_p.chmod(attrs | stat.S_IWRITE)
+                except OSError:
+                    pass
+            if win_err not in (5, 32, 33) and posix_err not in (
+                errno.EACCES,
+                errno.EBUSY,
+                errno.EAGAIN,
+                _ESTALE,
+                _ETXTBSY,
+            ):
+                # Not a transient lock — clean up partial tmp and propagate.
+                try:
+                    Path(tmp_path).unlink()
+                except OSError:
+                    pass
                 raise
-            time.sleep(0.5 * (2**_mkdir_attempt))
+            if _fsync_attempt == 11:
+                # Exhausted all retries — clean up partial tmp and propagate.
+                try:
+                    Path(tmp_path).unlink()
+                except OSError:
+                    pass
+                raise
+            time.sleep(min(15.0, 0.5 * (2**_fsync_attempt)))  # Backoff: 0.5s … 15s cap
+
+    if tmp_size <= 0:
+        try:
+            Path(tmp_path).unlink()
+        except OSError:
+            pass
+        raise OSError(
+            f"fsync produced a zero-byte or unmeasured file: {tmp_path}"
+        )
+    return tmp_size
 
 
 def _write_and_fsync(dataframe: pl.DataFrame, tmp_path: str) -> int:
@@ -1448,13 +1625,57 @@ def _write_and_fsync(dataframe: pl.DataFrame, tmp_path: str) -> int:
     generous.
 
     Returns the verified file size in bytes.
-    Raises OSError if the file is zero-byte or unmeasurable after retries.
+
+    Raises
+    ------
+    TypeError
+        * dataframe is not a polars.DataFrame (e.g. LazyFrame, pandas, dict)
+        * tmp_path is not a string
+    ValueError
+        * tmp_path is empty or whitespace
+    RuntimeError
+        * write_parquet raises any non-OSError exception (polars
+          ComputeError / SchemaError / PanicException, OOM, etc.).  The
+          partial tmp file is cleaned up first; the original exception is
+          chained via ``__cause__``.
+    OSError
+        * write_parquet fails 4× consecutively with a transient I/O error
+        * fsync fails either with a non-retriable error code or 12× in a row
+        * the final file is zero-byte or unmeasurable
+        In all cases the partial tmp file is removed before propagating.
     """
+    # ── Input validation at the API boundary ────────────────────────────
+    # The only caller today is save_results(), which validates upstream.
+    # Validating here makes the function safe for any future direct caller
+    # and turns a cryptic AttributeError (LazyFrame has no write_parquet in
+    # older polars versions, or it means something different in newer ones)
+    # into an actionable TypeError.
+    if not isinstance(dataframe, pl.DataFrame):
+        hint = (
+            " Call .collect() first if you have a LazyFrame."
+            if isinstance(dataframe, pl.LazyFrame)
+            else ""
+        )
+        raise TypeError(
+            f"dataframe must be polars.DataFrame, "
+            f"got {type(dataframe).__name__}.{hint}"
+        )
+    if not isinstance(tmp_path, str):
+        raise TypeError(
+            f"tmp_path must be a string, got {type(tmp_path).__name__}"
+        )
+    if not tmp_path.strip():
+        raise ValueError("tmp_path must not be empty or whitespace")
+
     # Retry write_parquet for transient NAS I/O errors (network drops, SMB
     # sharing violations, NFS stale handles).  Before each retry, remove the
     # corrupted partial .tmp file — parquet format is not appendable, so
-    # write_parquet must start from a clean slate.  Non-I/O errors (schema
-    # issues, OOM) are not caught and propagate immediately.
+    # write_parquet must start from a clean slate.  Non-I/O errors (polars
+    # ComputeError / SchemaError / PanicException / OOM) are not retried:
+    # they are almost always deterministic, so retrying wastes the backoff
+    # window.  Instead they are wrapped in RuntimeError with input context
+    # and the partial tmp file is cleaned up first — matches the pattern in
+    # winsorized_rolling_stats and save_results.
     for _write_attempt in range(4):
         try:
             dataframe.write_parquet(tmp_path)
@@ -1462,53 +1683,125 @@ def _write_and_fsync(dataframe: pl.DataFrame, tmp_path: str) -> int:
         except OSError:
             # Remove corrupted partial file before retrying.
             try:
-                os.remove(tmp_path)
+                Path(tmp_path).unlink()
             except OSError:
                 pass  # File may not have been created yet; ignore
             if _write_attempt == 3:
                 raise  # Exhausted all retries
             time.sleep(min(15.0, 1.0 * (2**_write_attempt)))  # Backoff: 1s, 2s, 4s
-
-    tmp_size = -1
-    for _fsync_attempt in range(12):
-        try:
-            fd = os.open(tmp_path, os.O_RDWR)
+        except Exception as e:
+            # Broad catch for non-OSError polars/arrow errors — never
+            # swallowed, always re-raised with context per CLAUDE.md.
             try:
-                os.fsync(fd)
-                tmp_size = os.fstat(fd).st_size
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"_write_and_fsync: polars write_parquet failed "
+                f"(tmp_path={tmp_path!r}, n_rows={dataframe.height}, "
+                f"n_cols={dataframe.width}). Underlying error: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+
+    # Fsync + size verification are delegated to the shared helper so the
+    # parquet and byte-buffer paths share one tested retry envelope.  The
+    # helper removes the partial tmp file on any failure before propagating.
+    return _fsync_and_verify_size(tmp_path)
+
+
+def _write_bytes_and_fsync(data: bytes | bytearray | memoryview, tmp_path: str) -> int:
+    """Write a byte buffer atomically to tmp_path, fsync, return verified size.
+
+    Bytes-equivalent of _write_and_fsync for non-parquet outputs (HTML reports,
+    JSON sidecars, etc.).  Uses the same two-phase retry envelope:
+      * Write phase: up to 4× on transient OSErrors (1s/2s/4s backoff).
+      * Fsync phase: up to 12× on transient AV/DLP locks (0.5s … 15s cap) via
+        the shared _fsync_and_verify_size helper.
+
+    Opens with O_BINARY on Windows (no CRLF translation) and an explicit os.write
+    loop — os.write may return fewer bytes than requested (POSIX spec), and a
+    zero-byte return after partial progress indicates disk-full / broken pipe.
+
+    Returns the verified size in bytes.  Raises OSError with ``size mismatch``
+    in the message if fsync reports a size different from ``len(data)`` (could
+    happen on a NAS with write-behind caching bugs).  On any failure, the
+    partial tmp file is cleaned up before propagating.
+
+    Raises
+    ------
+    TypeError
+        * data is not bytes / bytearray / memoryview
+        * tmp_path is not a string
+    ValueError
+        * tmp_path is empty or whitespace
+    OSError
+        * write phase fails 4× consecutively
+        * fsync phase fails (delegated to _fsync_and_verify_size)
+        * final file size != len(data)
+    """
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"data must be bytes-like (bytes, bytearray, memoryview), "
+            f"got {type(data).__name__}"
+        )
+    if not isinstance(tmp_path, str):
+        raise TypeError(
+            f"tmp_path must be a string, got {type(tmp_path).__name__}"
+        )
+    if not tmp_path.strip():
+        raise ValueError("tmp_path must not be empty or whitespace")
+
+    expected_size = len(data)
+
+    # Write phase: retry up to 4× for transient OSErrors.
+    for _write_attempt in range(4):
+        try:
+            # O_BINARY prevents \n→\r\n translation on Windows.
+            # On POSIX the constant is absent, fall back to 0 (no-op).
+            fd = os.open(
+                tmp_path,
+                os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+                0o666,
+            )
+            try:
+                # os.write may return fewer bytes than requested (POSIX spec).
+                # Loop until all bytes flushed, or raise on zero-write.
+                view = memoryview(data)
+                written_total = 0
+                while written_total < expected_size:
+                    written = os.write(fd, view[written_total:])
+                    if written == 0:
+                        raise OSError(
+                            f"os.write returned 0 bytes after "
+                            f"{written_total}/{expected_size} — disk may be full"
+                        )
+                    written_total += written
             finally:
                 os.close(fd)
-            break  # fsync succeeded
-        except OSError as e:
-            win_err = getattr(e, "winerror", 0)
-            posix_err = getattr(e, "errno", 0)
-            # Clear read-only attribute if a NAS compliance/DLP tool set it.
-            # WinError 5 (Access Denied) or POSIX EACCES on NFS can both
-            # indicate a read-only flag rather than a transient sharing lock.
-            if win_err == 5 or posix_err == errno.EACCES:
-                try:
-                    attrs = os.stat(tmp_path).st_mode
-                    if not (attrs & stat.S_IWRITE):
-                        os.chmod(tmp_path, attrs | stat.S_IWRITE)
-                except OSError:
-                    pass
-            if win_err not in (5, 32, 33) and posix_err not in (
-                errno.EACCES,
-                errno.EBUSY,
-                errno.EAGAIN,
-                _ESTALE,
-                _ETXTBSY,
-            ):
-                raise  # Not a transient lock — propagate immediately
-            if _fsync_attempt == 11:
-                raise  # Exhausted all retries
-            time.sleep(min(15.0, 0.5 * (2**_fsync_attempt)))  # Backoff: 0.5s … 15s cap
+            break  # Write succeeded
+        except OSError:
+            # Remove partial tmp file before retrying.
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+            if _write_attempt == 3:
+                raise  # Exhausted write retries
+            time.sleep(min(15.0, 1.0 * (2**_write_attempt)))  # Backoff: 1s, 2s, 4s
 
-    # Sanity check: ensure write_parquet actually produced a non-empty file.
-    # tmp_size was read via os.fstat(fd) on the open handle, bypassing SMB cache.
-    if tmp_size <= 0:
+    # Fsync phase: delegated to shared helper.  Partial-tmp cleanup on failure
+    # is handled by the helper.
+    tmp_size = _fsync_and_verify_size(tmp_path)
+
+    # Size verification against caller-provided expectation.
+    if tmp_size != expected_size:
+        try:
+            Path(tmp_path).unlink()
+        except OSError:
+            pass
         raise OSError(
-            f"write_parquet produced a zero-byte or unmeasured file: {tmp_path}"
+            f"Post-write size mismatch: expected {expected_size} bytes, "
+            f"got {tmp_size} bytes for {tmp_path}"
         )
     return tmp_size
 
@@ -1524,10 +1817,38 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
 
     Clears the read-only attribute on the target file if Access Denied
     (WinError 5 / EACCES) suggests it was set by backup/compliance tools.
+
+    Raises
+    ------
+    TypeError
+        * tmp_path or file_path is not a string
+    ValueError
+        * tmp_path or file_path is empty/whitespace
+        * tmp_path and file_path are identical (almost always a caller bug;
+          os.replace is a no-op on POSIX and fails on Windows)
     """
+    # ── Input validation at the API boundary ────────────────────────────
+    if not isinstance(tmp_path, str):
+        raise TypeError(
+            f"tmp_path must be a string, got {type(tmp_path).__name__}"
+        )
+    if not isinstance(file_path, str):
+        raise TypeError(
+            f"file_path must be a string, got {type(file_path).__name__}"
+        )
+    if not tmp_path.strip():
+        raise ValueError("tmp_path must not be empty or whitespace")
+    if not file_path.strip():
+        raise ValueError("file_path must not be empty or whitespace")
+    if tmp_path == file_path:
+        raise ValueError(
+            f"tmp_path and file_path must be distinct; both are {tmp_path!r}"
+        )
+
+    file_p = Path(file_path)
     for _attempt in range(12):
         try:
-            os.replace(tmp_path, file_path)
+            Path(tmp_path).replace(file_path)
             return
         except OSError as e:
             win_err = getattr(e, "winerror", None)
@@ -1545,14 +1866,12 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
             # Access Denied can mean the target file is read-only.
             # Backup/compliance tools on Isilon may set this attribute
             # on both Windows (WinError 5) and Linux (EACCES on NFS/SMB).
-            # Clear it before the next retry so os.replace can overwrite.
-            if (win_err == 5 or posix_err == errno.EACCES) and os.path.isfile(
-                file_path
-            ):
+            # Clear it before the next retry so Path.replace can overwrite.
+            if (win_err == 5 or posix_err == errno.EACCES) and file_p.is_file():
                 try:
-                    attrs = os.stat(file_path).st_mode
+                    attrs = file_p.stat().st_mode
                     if not (attrs & stat.S_IWRITE):
-                        os.chmod(file_path, attrs | stat.S_IWRITE)
+                        file_p.chmod(attrs | stat.S_IWRITE)
                 except OSError:
                     pass
             time.sleep(min(15.0, 0.5 * (2**_attempt)))  # Backoff: 0.5s … 15s cap
@@ -1665,11 +1984,12 @@ def save_results(
     dataframe, file_name, dup_pattern, exact_match = _build_filename(
         dataframe, file_name_prefix, sort_by_date_column
     )
-    file_path = os.path.join(folder_path, file_name)
+    folder = Path(folder_path)
+    file_path = str(folder / file_name)
     tmp_path = (
         f"{file_path}.{uuid.uuid4().hex[:8]}.tmp"  # Random suffix prevents collisions
     )
-    lock_path = os.path.join(folder_path, f".{file_name_prefix}.lock")
+    lock_path = str(folder / f".{file_name_prefix}.lock")
 
     # ── Steps 4-6: Pre-flight checks and folder setup ────────────────────
     _validate_path_lengths(tmp_path)
@@ -1717,7 +2037,7 @@ def save_results(
                 finally:
                     # chmod sets exact permissions regardless of umask.
                     # Only succeeds if we own the file (we created it first).
-                    os.chmod(lock_path, 0o666)
+                    Path(lock_path).chmod(0o666)
             except OSError:
                 pass  # Best-effort; FileLock will report the real error
 
@@ -1771,7 +2091,7 @@ def save_results(
         # lock timed out, or verification failed before rename).
         if not rename_done:
             try:
-                os.remove(tmp_path)
+                Path(tmp_path).unlink()
             except OSError:
                 pass  # tmp may already be gone or still locked; stale cleanup handles it
 

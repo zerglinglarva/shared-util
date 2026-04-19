@@ -43,7 +43,12 @@ def parse_arguments(
     # ── Step 1: Detect execution mode ────────────────────────────────────
     # Jupyter/IPython loads 'ipykernel'; CLI scripts have sys.argv[0] ending in '.py'.
     # In interactive mode argparse would choke on notebook/IDE argv, so we skip it.
-    is_interactive = "ipykernel" in sys.modules or not sys.argv[0].endswith(".py")
+    # Guard against empty sys.argv (embedded CPython, some test runners that
+    # monkeypatch argv, or odd dynamic-exec setups).  Index access on an
+    # empty list would IndexError at init before any pipeline logic runs.
+    is_interactive = "ipykernel" in sys.modules or not (
+        sys.argv and sys.argv[0].endswith(".py")
+    )
 
     # ── Step 2: Obtain raw string inputs ─────────────────────────────────
     if is_interactive:
@@ -147,7 +152,30 @@ def lazy_parquet(
     start_date: datetime.date,
     end_date: datetime.date,
 ) -> pl.LazyFrame:
+    """Lazy-scan every parquet file in ``folder_path``, validate schemas,
+    and return a single date-filtered ``LazyFrame``.
 
+    Notes
+    -----
+    The returned object is a ``LazyFrame``.  The NAS transient-lock retry
+    envelope inside this function covers ONLY the metadata reads
+    (``read_parquet_schema`` and ``scan_parquet``).  The actual payload
+    read happens later, when the caller invokes ``.collect()`` /
+    ``.sink_parquet()`` / ``.fetch()``, entirely outside this function's
+    control.
+
+    If the pipeline may run while ``save_results`` concurrently replaces
+    files on the shared NAS, the caller MUST wrap its materialization
+    call in its own transient-lock retry (mirroring the envelope in
+    ``save_results``: retry on WinError 5/32/33 and
+    EACCES/EBUSY/EAGAIN/ESTALE/ETXTBSY with 0.5s → 15s backoff).  Without
+    that, a collect-time lock or vanish will surface as an unhandled
+    ``OSError`` / ``ComputeError`` deep in downstream aggregation logic.
+
+    For callers that prefer eager materialization with the same retry
+    guarantees end-to-end, add a sibling ``eager_parquet`` — do NOT change
+    this function, which is contracted to stay lazy.
+    """
     if not folder_path or not folder_path.strip():
         raise ValueError("folder_path must not be empty or whitespace")
     if not date_column or not date_column.strip():
@@ -190,11 +218,14 @@ def lazy_parquet(
             time.sleep(0.5 * (2**_listdir_attempt))
     assert file_names is not None  # loop exits via break or raise
 
+    # Filter on extension only.  Do NOT gate with Path.is_file(): it
+    # swallows OSError (including ENOENT) and returns False, which would
+    # silently drop a file that vanished between iterdir and this check —
+    # bypassing the fail-loud logic in _read_schema_with_retry.  If a
+    # directory happens to carry a .parquet suffix, the schema read will
+    # raise loudly, which is the correct behavior.
     parquet_file_names = [
-        file
-        for file in file_names
-        if file.lower().endswith(".parquet")
-        and (folder / file).is_file()
+        file for file in file_names if file.lower().endswith(".parquet")
     ]
 
     if not parquet_file_names:
@@ -202,27 +233,55 @@ def lazy_parquet(
 
     # Read schemas and check compatibility before concatenating.
     # On a shared NAS, files can vanish between listdir and schema read
-    # (e.g. concurrent save_results deleting old date-range files).
-    # Skip files that disappear rather than crashing with an opaque ArrowError.
+    # (e.g. concurrent save_results deleting old date-range files) — those
+    # skip silently.  But transient AV/DLP/SMB locks (WinError 5/32/33,
+    # EACCES/EBUSY/EAGAIN/ESTALE/ETXTBSY) must NOT be treated as "vanished":
+    # swallowing them would drop a valid partition and silently under-count
+    # rows downstream.  Mirror the save_results retry envelope: 12× with
+    # 0.5s → 15s backoff; after that, raise loudly.
+    def _is_transient_lock(e: OSError) -> bool:
+        win_err = getattr(e, "winerror", 0)
+        posix_err = getattr(e, "errno", 0)
+        return win_err in (5, 32, 33) or posix_err in (
+            errno.EACCES,
+            errno.EBUSY,
+            errno.EAGAIN,
+            _ESTALE,
+            _ETXTBSY,
+        )
+
+    def _read_schema_with_retry(path: str) -> dict[str, pl.DataType]:
+        """Return schema.  Raises on any failure after exhausting retries.
+
+        ENOENT is NOT silently skipped: in the date-range-filename pattern
+        used by save_results, a concurrently-deleted file implies a
+        replacement file now exists that our stale iterdir snapshot did
+        not see.  Skipping the vanished file would leave a silent hole in
+        the dataset.  Raise and let the caller retry the whole load.
+        """
+        for _attempt in range(12):
+            try:
+                return pl.read_parquet_schema(path)
+            except OSError as e:
+                if not _is_transient_lock(e):
+                    raise
+                if _attempt == 11:
+                    raise
+                time.sleep(min(15.0, 0.5 * (2**_attempt)))
+        raise AssertionError("unreachable")  # loop exits via return or raise
+
     file_paths = [str(folder / file) for file in parquet_file_names]
     schemas: dict[str, dict[str, pl.DataType]] = {}
     for path in file_paths:
-        try:
-            schemas[path] = pl.read_parquet_schema(path)
-        except OSError:
-            continue  # File vanished or became unreadable; skip it
-        except Exception as e:
-            # Corrupted/truncated parquet files raise ComputeError (not OSError).
-            # Warn so the user knows, but don't crash the entire function
-            # when other valid files exist.
-            print(f"Warning: skipping {Path(path).name}: {e}")
-            continue
+        # Fail loud on corruption as well as I/O.  Orchestrators (Airflow,
+        # Dagster, cron) do not surface stdout warnings, so a warn+continue
+        # on ComputeError would silently shrink the dataset while the
+        # pipeline reported success.  Corrupt parquet is an inbound-boundary
+        # violation and must halt the load.
+        schemas[path] = _read_schema_with_retry(path)
 
-    # Re-filter file_paths to only those whose schema was successfully read
-    file_paths = [p for p in file_paths if p in schemas]
-
-    if not file_paths:
-        raise ValueError(f"No readable parquet files found in folder: {folder_path}")
+    # Every file's schema was read successfully (the loop above raises on
+    # any failure), so file_paths and schemas are already in sync.
     reference_path = file_paths[0]
     reference_schema = schemas[reference_path]
 
@@ -289,41 +348,43 @@ def lazy_parquet(
     # *position*, not by name. If two parquet files store the same columns
     # in a different order, positional concat silently produces wrong data
     # or raises a dtype-mismatch error at collect-time.
+    def _scan_with_retry(path: str) -> pl.LazyFrame:
+        """Build the lazy scan.  Raises on any failure after retries.
+
+        Same rationale as _read_schema_with_retry: ENOENT is not skipped
+        because the date-range-filename pattern means a vanished file
+        implies an unseen replacement.  Fail loud and let the caller retry.
+        """
+        for _attempt in range(12):
+            try:
+                return pl.scan_parquet(path)
+            except OSError as e:
+                if not _is_transient_lock(e):
+                    raise
+                if _attempt == 11:
+                    raise
+                time.sleep(min(15.0, 0.5 * (2**_attempt)))
+        raise AssertionError("unreachable")
+
     reference_columns = list(reference_schema.keys())
     dataframes = []
     for path in file_paths:
-        try:
-            # Cast to Date for day-level comparison.  For Date columns this
-            # is a no-op.  For Datetime columns it truncates to date, which
-            # prevents the <= filter from silently excluding same-day rows
-            # with non-midnight timestamps (e.g. 2024-01-15 23:59:59 would
-            # be excluded by <= Date(2024-01-15) without the cast, because
-            # Polars supercasts Date to Datetime midnight).
-            date_expr = pl.col(date_column).cast(pl.Date)
-            df = (
-                pl.scan_parquet(path)
-                .select(reference_columns)
-                .filter(
-                    (date_expr >= pl.lit(start_date)) & (date_expr <= pl.lit(end_date))
-                )
+        # Cast to Date for day-level comparison.  For Date columns this
+        # is a no-op.  For Datetime columns it truncates to date, which
+        # prevents the <= filter from silently excluding same-day rows
+        # with non-midnight timestamps (e.g. 2024-01-15 23:59:59 would
+        # be excluded by <= Date(2024-01-15) without the cast, because
+        # Polars supercasts Date to Datetime midnight).
+        scan = _scan_with_retry(path)
+        date_expr = pl.col(date_column).cast(pl.Date)
+        df = (
+            scan
+            .select(reference_columns)
+            .filter(
+                (date_expr >= pl.lit(start_date)) & (date_expr <= pl.lit(end_date))
             )
-            dataframes.append(df)
-        except Exception as e:
-            # File vanished or became unreadable after the schema check.
-            # Log the failure rather than silently swallowing — silent drops
-            # would hide a real bug (e.g. malformed filter expression) behind
-            # a smaller-than-expected row count at collect() time.
-            print(
-                f"Warning: skipping {Path(path).name} during scan: "
-                f"{type(e).__name__}: {e}"
-            )
-            continue
-
-    if not dataframes:
-        raise ValueError(
-            f"All parquet files in {folder_path} became unreadable "
-            f"between schema validation and scan"
         )
+        dataframes.append(df)
 
     # Explicit how="vertical" — pl.concat's default on LazyFrames requires
     # matching schema AND column order.  The .select(reference_columns) above

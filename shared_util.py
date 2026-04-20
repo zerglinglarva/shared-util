@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import errno
+import logging
 import os
 import re
 import stat
@@ -10,8 +11,11 @@ import sys
 import time
 import uuid
 import zoneinfo
+from collections.abc import Callable
 from pathlib import Path, PurePath
+from typing import Any, Literal, NamedTuple
 
+import exchange_calendars as xcals  # type: ignore[import-untyped]
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import polars as pl
@@ -142,6 +146,641 @@ def parse_arguments(
 
     return startdate, enddate, write_directory
 
+#################################################################################################
+# Compute default month-to-date date range from the composite exchange calendar of the given venues.
+
+def _mtd_safe_log_warning(fmt: str, *args: object) -> None:
+    """Log a warning without letting handler failures propagate.
+
+    The logging calls in this family surface library-inconsistency
+    signals to operators — they must not themselves become a new
+    failure mode. A misconfigured handler (broken formatter, dead
+    network-logging socket) raising inside ``.warning(...)`` would
+    otherwise escape the surrounding ``except`` and mask the caller's
+    conservative-return path with a logging-traceback. Swallow any
+    logger-side failure silently (the whole point of this helper is
+    best-effort logging).
+    """
+    try:
+        logging.getLogger(__name__).warning(fmt, *args)
+    except Exception:
+        # Intentionally silent: logger-side failures are best-effort
+        # only; the caller's conservative-return path is load-bearing.
+        pass
+
+
+def _mtd_validate_inputs(
+    venues: list[str],
+    combine_type: Literal["union", "intersect"],
+) -> list[str]:
+    """Validate inputs and return a deduplicated venue list.
+
+    Rejects bare str/bytes (which would silently iterate character-by-
+    character downstream) and non-list/tuple inputs. Deduplicates while
+    preserving caller order — duplicates are functionally harmless but
+    waste calendar loads and make error messages noisy.
+
+    ``combine_type`` is required with no default: the intersect↔union
+    distinction silently changes which dates flow downstream, so an
+    explicit choice prevents callers from picking up a silent behavior
+    change on future default edits.
+    """
+    if isinstance(venues, (str, bytes)):
+        raise TypeError(
+            f"compute_mtd_date_range: venues must be a list of strings, "
+            f"got {type(venues).__name__}"
+        )
+    if not isinstance(venues, (list, tuple)):
+        raise TypeError(
+            f"compute_mtd_date_range: venues must be a list or tuple, "
+            f"got {type(venues).__name__}"
+        )
+    if not venues:
+        raise ValueError("compute_mtd_date_range: venues must be non-empty")
+    if combine_type not in ("union", "intersect"):
+        raise ValueError(
+            f"compute_mtd_date_range: combine_type must be 'union' or "
+            f"'intersect', got {combine_type!r}"
+        )
+
+    # Materialize once before iterating. A hostile list subclass with an
+    # overridden ``__iter__`` could yield different elements on separate
+    # passes, letting an invalid venue pass the validation loop but
+    # reach the dedup loop (silent-wrong-answer). ``list(...)`` takes a
+    # single snapshot and validation + dedup then walk the same copy.
+    venues_snapshot: list[str] = list(venues)
+    seen: set[str] = set()
+    unique_venues: list[str] = []
+    for v in venues_snapshot:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(
+                f"compute_mtd_date_range: each venue must be a non-empty "
+                f"string, got {v!r}"
+            )
+        if v not in seen:
+            seen.add(v)
+            unique_venues.append(v)
+    return unique_venues
+
+
+def _mtd_load_calendars_and_tz(
+    unique_venues: list[str],
+) -> tuple[list[Any], datetime.tzinfo]:
+    """Load each venue's xcals calendar and resolve a single shared tz.
+
+    Loads per-venue (not via comprehension) so a failing venue names
+    itself. Requires all venues to share one timezone; the composite-
+    session logic is tz-ambiguous otherwise (US equity venues share
+    America/New_York — mixing US with non-US calendars is out of scope).
+    Mocks that slip a plain string through the str-label check are
+    caught by a final ``isinstance(tz, datetime.tzinfo)`` guard.
+    """
+    cals: list[Any] = []
+    for v in unique_venues:
+        try:
+            cal = xcals.get_calendar(v)
+        except Exception as e:
+            # xcals' exception class drifts across versions — catch
+            # broadly and re-raise with caller context.
+            raise ValueError(
+                f"compute_mtd_date_range: failed to load calendar for "
+                f"venue {v!r}: {e!s}"
+            ) from e
+        if cal is None:
+            # Documented to raise on unknown venue; guard against a
+            # mock/stub returning None so downstream ``.tz`` doesn't
+            # explode with an opaque AttributeError.
+            raise RuntimeError(
+                f"compute_mtd_date_range: xcals returned None for "
+                f"venue {v!r}"
+            )
+        cals.append(cal)
+    if not cals:
+        # unique_venues is non-empty by construction; belt-and-suspenders
+        # against a stray IndexError further down.
+        raise RuntimeError(
+            f"compute_mtd_date_range: no calendars loaded for "
+            f"venues={unique_venues}"
+        )
+
+    tzs: list[Any] = []
+    for v, c in zip(unique_venues, cals, strict=True):
+        try:
+            tzs.append(c.tz)
+        except Exception as e:
+            raise ValueError(
+                f"compute_mtd_date_range: failed to read tz from calendar "
+                f"for venue {v!r}: {e!s}"
+            ) from e
+
+    # Per-venue missing-tz check BEFORE the cross-venue comparison so
+    # the error names the offending venue(s) instead of surfacing a
+    # confusing ``{"None", "America/New_York"}`` multi-tz set.
+    tz_missing = [v for v, t in zip(unique_venues, tzs, strict=True) if t is None]
+    if tz_missing:
+        raise ValueError(
+            f"compute_mtd_date_range: calendar(s) for {tz_missing} "
+            f"have no timezone"
+        )
+
+    tz_labels: set[str] = set()
+    for v, t in zip(unique_venues, tzs, strict=True):
+        try:
+            tz_labels.add(str(t))
+        except Exception as e:
+            # A pathological ``__str__`` should name the offending
+            # calendar, not bubble up a bare TypeError.
+            raise ValueError(
+                f"compute_mtd_date_range: failed to stringify tz for "
+                f"venue {v!r}: {e!s}"
+            ) from e
+    if len(tz_labels) != 1:
+        raise ValueError(
+            f"compute_mtd_date_range: venues span multiple timezones "
+            f"{tz_labels}"
+        )
+
+    # Defense-in-depth against the pytz↔zoneinfo↔dateutil.tz mix: two
+    # different tzinfo implementations can both stringify to
+    # "America/New_York" but be non-identical objects. CPython's tz-
+    # aware comparison handles mixed implementations correctly via UTC
+    # normalization, so this is not a silent-wrong-answer hazard today,
+    # but a narrower contract (single implementation) fails faster and
+    # survives future stdlib changes. Check via type name to avoid
+    # hashing tzinfo instances (which a pathological mock could break).
+    tz_types = {type(t).__name__ for t in tzs}
+    if len(tz_types) != 1:
+        raise ValueError(
+            f"compute_mtd_date_range: venues use multiple tzinfo "
+            f"implementations {tz_types} — mixing pytz / zoneinfo / "
+            f"dateutil.tz is rejected to prevent implementation-drift "
+            f"artifacts in session_close comparisons"
+        )
+
+    tz = tzs[0]
+    if not isinstance(tz, datetime.tzinfo):
+        # A mock could slip a plain string through the str-label check
+        # (str of a str is itself). ``datetime.now`` strictly requires
+        # a tzinfo subclass.
+        raise TypeError(
+            f"compute_mtd_date_range: calendar tz must be a datetime.tzinfo "
+            f"subclass, got {type(tz).__name__} ({tz!r})"
+        )
+    return cals, tz
+
+
+def _mtd_now_local(tz: datetime.tzinfo) -> datetime.datetime:
+    """Return ``datetime.now(tz=tz)`` with a domain-wrapped failure.
+
+    A pathological but isinstance-passing tzinfo subclass (broken
+    utcoffset / fromutc, or a test double) can crash inside CPython's
+    datetime.now C implementation. Wrap so callers see a coherent
+    RuntimeError instead of an opaque stdlib traceback.
+    """
+    try:
+        return datetime.datetime.now(tz=tz)
+    except Exception as e:
+        raise RuntimeError(
+            f"compute_mtd_date_range: failed to compute current local time "
+            f"from calendar tz={tz!r} ({type(tz).__name__}): "
+            f"{type(e).__name__}: {e!s}"
+        ) from e
+
+
+def _mtd_make_session_probe(
+    cals: list[Any],
+    combine_type: Literal["union", "intersect"],
+) -> tuple[Callable[[datetime.date], bool], list[BaseException]]:
+    """Build the session probe and its shared error-capture list.
+
+    The returned probe treats OOB or erroring dates as "not a session"
+    so the lookback loop can step past rather than crash. Captured
+    exceptions let a lookback-exhaustion error distinguish "library
+    fault" from "genuine long closure" without spamming logs on every
+    OOB probe. ``all`` for intersect, ``any`` for union.
+    """
+    # Defensive: empty ``cals`` would cause ``all(())`` → True under
+    # intersect (silently marking every date a session → wrong answer)
+    # and ``any(())`` → False under union (silently marking every date
+    # a non-session → 30-day exhaustion error). The orchestrator's
+    # calendar-loader guarantees non-empty cals, but this helper is
+    # private-yet-reachable via direct import; fail fast here against
+    # future refactors or test harnesses that bypass the orchestrator.
+    if not cals:
+        raise RuntimeError(
+            "compute_mtd_date_range: _mtd_make_session_probe requires a "
+            "non-empty cals list"
+        )
+    # Same defense-in-depth for combine_type: a direct caller with
+    # ``combine_type="Intersect"`` (wrong case) or an unexpected string
+    # would silently fall back to ``any`` (union semantics) in the
+    # ternary below — a silent-wrong-answer under an "intersect" label.
+    # The orchestrator already validates via ``_mtd_validate_inputs``,
+    # but helpers re-checking their own preconditions is cheap insurance.
+    if combine_type not in ("union", "intersect"):
+        raise ValueError(
+            f"compute_mtd_date_range: _mtd_make_session_probe combine_type "
+            f"must be 'union' or 'intersect', got {combine_type!r}"
+        )
+
+    probe_errors: list[BaseException] = []
+    combine_fn = all if combine_type == "intersect" else any
+
+    def _is_target_session(d: datetime.date) -> bool:
+        try:
+            return combine_fn(c.is_session(d) for c in cals)
+        except Exception as e:
+            probe_errors.append(e)
+            return False
+
+    return _is_target_session, probe_errors
+
+
+def _mtd_should_include_today(
+    *,
+    now_local: datetime.datetime,
+    today: datetime.date,
+    cals: list[Any],
+    combine_type: Literal["union", "intersect"],
+    is_target_session: Callable[[datetime.date], bool],
+    unique_venues: list[str],
+) -> bool:
+    """Aggressive "today" rule: include today iff ``now_local`` is at or
+    past the latest session close among venues whose calendar has today
+    as a session.
+
+    intersect: ``is_target_session(today)`` guarantees every venue has
+        today as a session, so ``session_close`` yields a concrete close
+        for each; any None is a library regression and we conservatively
+        exclude today.
+    union: only the subset of venues that trade today contribute — the
+        rest may return None or raise (OOB). Both are filtered; the
+        "has the day ended" judgment is against the latest-closing venue
+        in the contributing subset (same conservative posture as
+        intersect, scoped to the subset).
+
+    Two-layer sentinel handling: (1) fast-reject on explicit ``None``;
+    (2) any other pathological value (``pd.NaT``, tz-naive datetime,
+    un-comparable types, ``bool``-raisers) is caught by the outer
+    ``except`` and logged. Do NOT add a per-element ``bool(cl)`` filter —
+    ``bool(pd.NaT)`` raises, defeating the purpose.
+    """
+    if not is_target_session(today):
+        return False
+    try:
+        if combine_type == "intersect":
+            closes = [c.session_close(today) for c in cals]
+            if any(cl is None for cl in closes):
+                return False
+            latest_close = max(closes)
+            # bool(numpy.bool_) → Python bool (fine).
+            # bool(pd.NaT) → TypeError → caught below.
+            # Plain datetime comparison → Python bool.
+            return bool(now_local >= latest_close)
+        # union
+        union_closes: list[Any] = []
+        union_close_errors: list[BaseException] = []
+        for c in cals:
+            try:
+                cl = c.session_close(today)
+            except Exception as e:
+                # Venue doesn't have today as a session (OOB or non-
+                # trading day) — it doesn't contribute. Capture for
+                # the post-loop library-fault check below.
+                union_close_errors.append(e)
+                continue
+            if cl is not None:
+                union_closes.append(cl)
+        if not union_closes:
+            # is_target_session(today) was True (at least one venue
+            # reports today as a session), but no venue yielded a
+            # concrete close — library inconsistency. Surface the last
+            # per-cal error so operators don't silently stale-date
+            # every run when e.g. session_close regresses library-wide.
+            _mtd_safe_log_warning(
+                "compute_mtd_date_range: union today-inclusion found "
+                "is_target_session(today)=True but zero concrete closes "
+                "(venues=%s, today=%s, close_errors=%d, last=%s)",
+                unique_venues, today, len(union_close_errors),
+                (f"{type(union_close_errors[-1]).__name__}: "
+                 f"{union_close_errors[-1]!s}"
+                 if union_close_errors else "no-exception"),
+            )
+            return False
+        latest_close = max(union_closes)
+        return bool(now_local >= latest_close)
+    except Exception as e:
+        # session_close / max / comparison / bool-coerce failure → be
+        # conservative. Log (not silent-swallow) so upstream regressions
+        # — e.g., session_close regressing to tz-naive — surface in
+        # operator logs instead of silently stale-dating every run.
+        _mtd_safe_log_warning(
+            "compute_mtd_date_range: today-inclusion check failed, "
+            "excluding today (venues=%s, combine_type=%s, today=%s): "
+            "%s: %s",
+            unique_venues, combine_type, today, type(e).__name__, e,
+        )
+        return False
+
+
+def _mtd_resolve_lookback_days() -> int:
+    """Resolve the lookback window, honoring an env-var override.
+
+    Default 30d covers every major-venue closure on record. Long
+    closures (e.g. Russian equities 2022, Greek banks 2015) or rare
+    holiday+outage overlaps may exceed this — operators override via
+    ``COMPUTE_MTD_MAX_LOOKBACK_DAYS`` instead of patching this file.
+
+    A safety cap (10 years) rejects runaway values. Without it, a typo
+    like ``COMPUTE_MTD_MAX_LOOKBACK_DAYS=100000`` (extra zero) would
+    silently trigger ~100k probe iterations, each loading and querying
+    calendars — a pipeline-hang / soft-DOS with no surfacing error.
+    10y is far beyond any plausible continuous market closure while
+    still finite and bounded.
+    """
+    default_days = 30
+    max_allowed_days = 3650  # 10 years — cap against env-var typos.
+    raw = os.environ.get("COMPUTE_MTD_MAX_LOOKBACK_DAYS")
+    if raw is None or raw == "":
+        return default_days
+    try:
+        days = int(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"compute_mtd_date_range: env var "
+            f"COMPUTE_MTD_MAX_LOOKBACK_DAYS must be a positive integer, "
+            f"got {raw!r}"
+        ) from e
+    if days < 1:
+        raise ValueError(
+            f"compute_mtd_date_range: env var "
+            f"COMPUTE_MTD_MAX_LOOKBACK_DAYS must be a positive integer, "
+            f"got {raw!r}"
+        )
+    if days > max_allowed_days:
+        raise ValueError(
+            f"compute_mtd_date_range: env var "
+            f"COMPUTE_MTD_MAX_LOOKBACK_DAYS={raw!r} exceeds safety cap of "
+            f"{max_allowed_days} days (likely a misconfiguration; raise "
+            f"the cap in this helper if a legitimate need exists)"
+        )
+    return days
+
+
+def _mtd_find_enddate(
+    *,
+    today: datetime.date,
+    include_today: bool,
+    max_lookback: int,
+    is_target_session: Callable[[datetime.date], bool],
+    probe_errors: list[BaseException],
+    unique_venues: list[str],
+    combine_type: Literal["union", "intersect"],
+) -> datetime.date:
+    """Walk backwards from today (or yesterday) until a combined session
+    is found, up to ``max_lookback`` days.
+
+    On exhaustion, surface the last probe exception in the error so
+    operators can tell a library fault apart from a genuine long closure.
+    """
+    try:
+        # Guard against ``today == date.min`` (pathological mocked clock
+        # / epoch-fallback env): subtracting a day would raise
+        # OverflowError; convert to a domain RuntimeError.
+        probe = today if include_today else today - datetime.timedelta(days=1)
+    except OverflowError as e:
+        raise RuntimeError(
+            f"compute_mtd_date_range: date underflow computing initial "
+            f"probe from today={today}"
+        ) from e
+    for _ in range(max_lookback):
+        if is_target_session(probe):
+            return probe
+        try:
+            probe -= datetime.timedelta(days=1)
+        except OverflowError as e:
+            raise RuntimeError(
+                f"compute_mtd_date_range: date underflow during lookback "
+                f"from today={today} (probe reached {probe})"
+            ) from e
+
+    # Build the hint defensively: a hostile exception (custom
+    # ``__str__`` that raises) would otherwise cause the f-string to
+    # fail *during RuntimeError construction*, masking the load-bearing
+    # "no session found" diagnostic with a meaningless format-error
+    # traceback. Fall back to a bare count if stringification fails.
+    hint = ""
+    if probe_errors:
+        last = probe_errors[-1]
+        try:
+            last_str = str(last)
+        except Exception:
+            last_str = "<exception __str__ raised>"
+        try:
+            last_type = type(last).__name__
+        except Exception:
+            last_type = "<unknown>"
+        hint = (
+            f"; {len(probe_errors)} of {max_lookback} probe(s) raised — "
+            f"last was {last_type}: {last_str} (possible calendar-library "
+            f"fault rather than long closure)"
+        )
+    raise RuntimeError(
+        f"compute_mtd_date_range: no {combine_type} session across "
+        f"{unique_venues} within {max_lookback} days of {today}"
+        f"{hint}"
+    )
+
+
+def _mtd_find_month_start_session(
+    *,
+    enddate: datetime.date,
+    is_target_session: Callable[[datetime.date], bool],
+    unique_venues: list[str],
+    combine_type: Literal["union", "intersect"],
+) -> datetime.date:
+    """Return the first combined session in ``enddate``'s calendar month.
+
+    ``enddate`` itself is already a combined session inside the probed
+    window, so this loop is guaranteed to succeed under normal
+    operation; the final raise exists only to survive a future refactor
+    that might change the loop boundaries.
+    """
+    month_first = datetime.date(enddate.year, enddate.month, 1)
+    probe = month_first
+    while probe <= enddate:
+        if is_target_session(probe):
+            return probe
+        try:
+            probe += datetime.timedelta(days=1)
+        except OverflowError as e:
+            # Symmetric with _mtd_find_enddate's underflow guard. Only
+            # reachable in a degenerate clock-mocked scenario where
+            # enddate approaches date.max and is_target_session(enddate)
+            # returns False (e.g., calendar state flipped between
+            # enddate discovery and this search). Wrap so the caller
+            # sees a domain error, not a bare stdlib OverflowError.
+            raise RuntimeError(
+                f"compute_mtd_date_range: date overflow advancing probe "
+                f"in month-start search (probe reached {probe}, "
+                f"enddate={enddate})"
+            ) from e
+    raise RuntimeError(
+        f"compute_mtd_date_range: no {combine_type} session in "
+        f"[{month_first}, {enddate}] across {unique_venues}"
+    )
+
+
+def _mtd_check_postconditions(
+    *,
+    startdate: datetime.date,
+    enddate: datetime.date,
+    today: datetime.date,
+    is_target_session: Callable[[datetime.date], bool],
+    unique_venues: list[str],
+    combine_type: Literal["union", "intersect"],
+) -> None:
+    """Validate the result tuple against every advertised invariant.
+
+    Explicit raises (not ``assert``) so these guards survive ``python
+    -O`` / PYTHONOPTIMIZE, which strips assertions. A corrupt date
+    range silently flowing downstream is the worst failure mode this
+    function can produce, so the checks run unconditionally.
+    """
+    if startdate > enddate:
+        raise RuntimeError(
+            f"compute_mtd_date_range: post-condition violated — "
+            f"startdate={startdate} > enddate={enddate}"
+        )
+    if (startdate.year, startdate.month) != (enddate.year, enddate.month):
+        raise RuntimeError(
+            f"compute_mtd_date_range: post-condition violated — startdate "
+            f"{startdate} and enddate {enddate} span different months"
+        )
+    if enddate > today:
+        # Aggressive-today rule must never produce a future enddate.
+        raise RuntimeError(
+            f"compute_mtd_date_range: post-condition violated — "
+            f"enddate={enddate} is after today={today}"
+        )
+    if not (is_target_session(startdate) and is_target_session(enddate)):
+        # Re-verify session membership via the guarded probe (OOB-safe)
+        # so a pathological calendar cannot explode here on a raw
+        # is_session call.
+        raise RuntimeError(
+            f"compute_mtd_date_range: post-condition violated — "
+            f"startdate={startdate} or enddate={enddate} is not a "
+            f"{combine_type} session across {unique_venues}"
+        )
+
+
+def compute_mtd_date_range(
+    venues: list[str],
+    combine_type: Literal["union", "intersect"],
+) -> tuple[datetime.date, datetime.date]:
+    """
+    Return (default_enddate, default_startdate) from the combined trading
+    calendars of the given venues.
+
+    combine_type:
+        ``"intersect"`` — a date counts iff it is a session on *every*
+            venue. Use when a single "all-markets-open" date is required
+            (e.g. cross-venue signal construction on shared trading days).
+        ``"union"`` — a date counts iff it is a session on *any* venue.
+            Use when any contributing venue's data is sufficient for the
+            day (e.g. processing per-venue data independently).
+
+    default_enddate: most recent combined session under ``combine_type``.
+        Aggressive "today" rule — today counts iff it is a combined
+        session AND current local time is at or past the latest session
+        close among venues whose calendar has today as a session. For
+        ``intersect`` that's all venues; for ``union`` only the subset
+        that trades today contributes to the close.
+    default_startdate: first combined session in the calendar month
+        containing default_enddate.
+
+    The lookback window defaults to 30 days and can be overridden via the
+    ``COMPUTE_MTD_MAX_LOOKBACK_DAYS`` environment variable (positive int)
+    for markets with historic long closures (e.g. Russian equities 2022).
+
+    Note
+    ----
+    All venues must share a single timezone for both modes. Cross-tz
+    ``union`` is ambiguous ("today" depends on reference tz) and is
+    rejected.
+
+    The body of this function is a thin orchestrator over ``_mtd_*``
+    helpers (defined above) — each helper encapsulates one phase with
+    its own error contract. Extend behavior by editing the relevant
+    helper, not by re-inlining logic here.
+
+    Raises
+    ------
+    TypeError
+        ``venues`` is not a list/tuple of strings (bare str rejected so it
+        does not silently iterate as characters).
+    ValueError
+        Empty venue list, non-string or blank venue code, unknown venue,
+        any calendar missing a timezone, venues spanning multiple
+        timezones or tzinfo implementations, invalid ``combine_type``,
+        or a ``COMPUTE_MTD_MAX_LOOKBACK_DAYS`` value that is non-integer,
+        non-positive, or exceeds the 10-year safety cap.
+    RuntimeError
+        Calendar tz fails to produce a current local time; no combined
+        session within the configured lookback (error includes last
+        probe exception when the exhaustion coincides with library
+        faults); post-condition violation (startdate > enddate,
+        cross-month range, future enddate, or either endpoint not a
+        combined session); or (defensively) no combined session within
+        the enddate's calendar month.
+    """
+    unique_venues = _mtd_validate_inputs(venues, combine_type)
+    # Resolve lookback BEFORE loading calendars. A malformed env var
+    # (non-int, negative, or exceeding the 10y safety cap) should fail
+    # fast — before xcals.get_calendar incurs its cache / network cost
+    # for every venue. The result is consumed by _mtd_find_enddate
+    # below; binding it here keeps env-var parse failures at the
+    # earliest sensible boundary.
+    max_lookback = _mtd_resolve_lookback_days()
+
+    cals, tz = _mtd_load_calendars_and_tz(unique_venues)
+    now_local = _mtd_now_local(tz)
+    today = now_local.date()
+
+    is_target_session, probe_errors = _mtd_make_session_probe(cals, combine_type)
+    include_today = _mtd_should_include_today(
+        now_local=now_local,
+        today=today,
+        cals=cals,
+        combine_type=combine_type,
+        is_target_session=is_target_session,
+        unique_venues=unique_venues,
+    )
+
+    enddate = _mtd_find_enddate(
+        today=today,
+        include_today=include_today,
+        max_lookback=max_lookback,
+        is_target_session=is_target_session,
+        probe_errors=probe_errors,
+        unique_venues=unique_venues,
+        combine_type=combine_type,
+    )
+    startdate = _mtd_find_month_start_session(
+        enddate=enddate,
+        is_target_session=is_target_session,
+        unique_venues=unique_venues,
+        combine_type=combine_type,
+    )
+    _mtd_check_postconditions(
+        startdate=startdate,
+        enddate=enddate,
+        today=today,
+        is_target_session=is_target_session,
+        unique_venues=unique_venues,
+        combine_type=combine_type,
+    )
+    return enddate, startdate
 
 ###################################################################################################
 # Define function to lazy scan parquet files, concatenate them into a single polars lazyframe
@@ -397,6 +1036,516 @@ def lazy_parquet(
 
 ###################################################################################################
 # Define a function to compute rolling winsorized statistics
+class _WinsorPlan(NamedTuple):
+    """Expressions and column aliases for the winsorized-rolling pipeline.
+
+    Bundles the input-neutralized ``val_expr`` (fed into ``rolling().agg()``),
+    the final ``mean_final`` / ``std_final`` output expressions, and the
+    collision-proof internal column aliases used to pass sort / sum /
+    sum-of-squares / length through the pipeline.
+    """
+    val_expr: pl.Expr
+    mean_final: pl.Expr
+    std_final: pl.Expr
+    tag: str
+    sorted_c: str
+    sum_c: str
+    ss_c: str
+    len_c: str
+
+
+def _validate_winsorized_args(
+    df: pl.DataFrame,
+    index_col: str,
+    val_col: str,
+    group_by: str | None,
+    window: str | None,
+    window_size: int | None,
+    min_samples: int,
+) -> None:
+    """Parameter-shape validation — no df inspection beyond the type check.
+
+    Verifies df is a DataFrame, column-name arguments are non-empty strings,
+    exactly one of ``window`` / ``window_size`` is provided, and
+    ``min_samples`` is a positive int not exceeding ``window_size``.
+    """
+    if not isinstance(df, pl.DataFrame):
+        raise TypeError(
+            f"df must be polars.DataFrame, got {type(df).__name__}"
+        )
+    for arg_name, arg_val in (
+        ("index_col", index_col),
+        ("val_col", val_col),
+    ):
+        if not isinstance(arg_val, str) or not arg_val:
+            raise TypeError(
+                f"{arg_name} must be a non-empty string, got {arg_val!r}"
+            )
+    if group_by is not None and (not isinstance(group_by, str) or not group_by):
+        raise TypeError(
+            f"group_by must be None or a non-empty string, got {group_by!r}"
+        )
+
+    # Exactly one of window / window_size must be provided.
+    if (window is None) == (window_size is None):
+        raise ValueError(
+            "exactly one of window (duration string) or window_size "
+            "(positive int, count-based) must be provided; got "
+            f"window={window!r}, window_size={window_size!r}"
+        )
+    if window is not None and (not isinstance(window, str) or not window):
+        raise TypeError(
+            f"window must be a non-empty string, got {window!r}"
+        )
+    if window_size is not None:
+        if not isinstance(window_size, int) or isinstance(window_size, bool) or window_size <= 0:
+            raise ValueError(
+                f"window_size must be a positive int, got {window_size!r}"
+            )
+    if not isinstance(min_samples, int) or isinstance(min_samples, bool) or min_samples < 1:
+        raise ValueError(
+            f"min_samples must be a positive int, got {min_samples!r}"
+        )
+    if window_size is not None and min_samples > window_size:
+        raise ValueError(
+            f"min_samples ({min_samples}) must be <= window_size ({window_size})"
+        )
+
+
+def _validate_winsorized_schema(
+    df: pl.DataFrame,
+    index_col: str,
+    val_col: str,
+    group_by: str | None,
+) -> tuple[pl.DataType, pl.DataType]:
+    """Schema-dependent validation; returns ``(idx_dtype, val_dtype)``.
+
+    Verifies column existence + distinctness, ``val_col`` is a non-Boolean
+    numeric dtype, ``index_col`` is Integer / Date / Datetime with no
+    nulls, ``group_by`` (if given) is a groupable dtype with no nulls,
+    and neither ``index_col`` nor ``group_by`` collides with the reserved
+    output column names.
+    """
+    required_cols = [index_col, val_col] + ([group_by] if group_by else [])
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Column(s) not found in df: {missing}. "
+            f"Available: {df.columns}"
+        )
+
+    # Aliased column names (e.g. group_by == index_col) would make rolling()
+    # produce a duplicate-column error or silently mis-aggregate. Reject here.
+    if len(set(required_cols)) != len(required_cols):
+        raise ValueError(
+            f"index_col, val_col, and group_by must all be distinct; got "
+            f"index_col={index_col!r}, val_col={val_col!r}, "
+            f"group_by={group_by!r}"
+        )
+
+    val_dtype = df.schema[val_col]
+    if not val_dtype.is_numeric() or isinstance(val_dtype, pl.Boolean):
+        raise TypeError(
+            f"val_col {val_col!r} must be a numeric (non-Boolean) dtype, "
+            f"got {val_dtype}"
+        )
+
+    # polars.DataFrame.rolling() only supports Integer, Date, or Datetime
+    # index columns (a monotonic timeline). Time and Duration pass the
+    # general is_temporal() gate but are rejected by rolling() with an
+    # opaque error; restrict to the officially supported set up front.
+    idx_dtype = df.schema[index_col]
+    idx_ok = idx_dtype.is_integer() or isinstance(idx_dtype, (pl.Date, pl.Datetime))
+    if not idx_ok:
+        raise TypeError(
+            f"index_col {index_col!r} must be an integer, Date, or Datetime "
+            f"dtype; got {idx_dtype} (Time and Duration are not supported)"
+        )
+    if df[index_col].null_count() > 0:
+        raise ValueError(
+            f"index_col {index_col!r} contains null values; rolling windows "
+            f"require a non-null monotonic index"
+        )
+
+    # group_by column dtype must be groupable; nested/object dtypes cause
+    # polars to error inside rolling() with an opaque message.
+    if group_by is not None:
+        gb_dtype = df.schema[group_by]
+        if isinstance(gb_dtype, (pl.List, pl.Struct, pl.Array, pl.Object)):
+            raise TypeError(
+                f"group_by {group_by!r} has dtype {gb_dtype}, which is not "
+                f"groupable; use a scalar dtype (Int/Utf8/Categorical/Date/…)"
+            )
+        # Polars silently lumps all null group keys together, which is
+        # almost never what the caller wants; fail loudly instead.
+        if df[group_by].null_count() > 0:
+            raise ValueError(
+                f"group_by {group_by!r} contains null values; drop or fill "
+                f"them before calling (polars would otherwise group all "
+                f"nulls into a single bucket)"
+            )
+
+    # Output-column collision: rolling().agg() preserves index_col and
+    # group_by in the output. If either is named "winsorized_mean" or
+    # "winsorized_std", the final with_columns() would silently overwrite
+    # it — a genuine silent-corruption risk. Reject up front.
+    _output_cols = {"winsorized_mean", "winsorized_std"}
+    _reserved_conflict = _output_cols.intersection(
+        {index_col, group_by} - {None}
+    )
+    if _reserved_conflict:
+        raise ValueError(
+            f"index_col/group_by cannot be named {sorted(_reserved_conflict)!r}; "
+            f"those names are reserved for this function's output columns"
+        )
+
+    return idx_dtype, val_dtype
+
+
+def _validate_winsorized_window_string(
+    window: str,
+    index_col: str,
+    idx_dtype: pl.DataType,
+) -> None:
+    """Parse the window string and cross-check its unit against ``idx_dtype``.
+
+    Polars accepts compound durations like ``"1d12h"``, plus the integer-
+    index unit ``"i"``. Catching malformed / zero-magnitude / unit-
+    mismatched cases here turns opaque mid-plan parse errors into
+    actionable messages.
+    """
+    _units_re = re.compile(r"(ns|us|ms|mo|[smhdwqyi])")
+    _window_components_re = re.compile(r"(\d+)(ns|us|ms|mo|[smhdwqyi])")
+    if not re.fullmatch(r"(\d+(ns|us|ms|mo|[smhdwqyi]))+", window):
+        raise ValueError(
+            f"window {window!r} is not a valid polars duration string; "
+            f"expected e.g. '30s', '5m', '1d', '1mo', '10i' (or compound "
+            f"forms like '1d12h')"
+        )
+    # Zero-magnitude windows ("0s", "0i", "0d0h") trigger a deep polars
+    # "window must be positive" error; catch it here.
+    if all(int(mag) == 0 for mag, _ in _window_components_re.findall(window)):
+        raise ValueError(
+            f"window {window!r} has zero total magnitude; rolling windows "
+            f"must be strictly positive"
+        )
+    window_units = _units_re.findall(window)
+    if idx_dtype.is_integer():
+        if any(u != "i" for u in window_units):
+            raise ValueError(
+                f"window {window!r} uses temporal units but index_col "
+                f"{index_col!r} is integer ({idx_dtype}); use an "
+                f"'i'-suffixed window like '10i'"
+            )
+    else:
+        if "i" in window_units:
+            raise ValueError(
+                f"window {window!r} uses the integer unit 'i' but index_col "
+                f"{index_col!r} is temporal ({idx_dtype}); use duration "
+                f"units like 's', 'm', 'h', 'd', 'mo'"
+            )
+
+
+def _build_winsorized_plan(val_col: str, min_samples: int) -> _WinsorPlan:
+    """Build the per-window winsorized-mean / -std expressions.
+
+    ``min_samples`` raises the per-branch gate floor so the caller can
+    align with a count-based ``rolling_*(window_size=N, min_samples=M)``.
+    """
+    # Collision-proof internal column names — a caller's df may already
+    # have a column literally called "_sorted", "_sum", etc.
+    tag = f"__wrs_{uuid.uuid4().hex[:8]}"
+    sorted_c, sum_c, ss_c, len_c = (
+        f"{tag}_sorted", f"{tag}_sum", f"{tag}_ss", f"{tag}_len",
+    )
+
+    # Cast val_col to Float64 up-front, then neutralize non-finite inputs:
+    #   * Float64 avoids silent integer overflow in x*x / sum-of-squares
+    #   * mapping ±Inf/NaN to null keeps them out of min/max, which would
+    #     otherwise make a single infinity contaminate w_sum / w_ss via
+    #     Inf - Inf = NaN and mask the entire window's output as None.
+    #   * a null row stays excluded by drop_nulls() and by sum()'s null-skip
+    #     semantics, so the rest of the window still produces valid stats.
+    _raw = pl.col(val_col).cast(pl.Float64, strict=True)
+    val_expr = pl.when(_raw.is_finite()).then(_raw).otherwise(None)
+
+    # Shorthand Expressions
+    s = pl.col(sorted_c)
+    n = pl.col(len_c)
+    raw_sum = pl.col(sum_c)
+    raw_ss = pl.col(ss_c)
+
+    # Get the 1st and 2nd lowest and highest values, with nulls for out-of-bounds
+    lo, lo2 = s.list.get(0, null_on_oob=True), s.list.get(1, null_on_oob=True)
+    hi, hi2 = s.list.get(-1, null_on_oob=True), s.list.get(-2, null_on_oob=True)
+
+    w_sum = raw_sum - lo - hi + lo2 + hi2
+    w_ss = raw_ss - lo * lo - hi * hi + lo2 * lo2 + hi2 * hi2
+
+    mean_big = w_sum / n
+    # Clamp at 0 before sqrt: catastrophic cancellation on near-constant
+    # windows can make the numerator a tiny negative, which sqrt turns to NaN.
+    var_big = ((w_ss - n * mean_big * mean_big) / (n - 1)).clip(lower_bound=0)
+
+    mean_small = raw_sum / n
+    var_small = ((raw_ss - n * mean_small * mean_small) / (n - 1)).clip(lower_bound=0)
+
+    # Gate every branch on the minimum n required so disallowed sizes hit
+    # `otherwise(None)` instead of computing 0/0 (NaN) or a degenerate value.
+    # min_samples raises the floor on top of the intrinsic per-branch minima
+    # (3 for winsorized, 1/2 for the small-window fallbacks).
+    gate_big = max(3, min_samples)
+    gate_mean_small = max(1, min_samples)
+    gate_std_small = max(2, min_samples)
+    mean_expr = (
+        pl.when(n >= gate_big).then(mean_big)
+        .when(n >= gate_mean_small).then(mean_small)
+        .otherwise(None)
+    )
+    std_expr = (
+        pl.when(n >= gate_big).then(var_big.sqrt())
+        .when(n >= gate_std_small).then(var_small.sqrt())
+        .otherwise(None)
+    )
+
+    # Final guard: any residual NaN or ±Inf (e.g. overflow on extreme inputs,
+    # or non-finite values leaking in from val_col) becomes None.
+    mean_final = pl.when(mean_expr.is_finite()).then(mean_expr).otherwise(None)
+    std_final = pl.when(std_expr.is_finite()).then(std_expr).otherwise(None)
+
+    return _WinsorPlan(
+        val_expr=val_expr,
+        mean_final=mean_final,
+        std_final=std_final,
+        tag=tag,
+        sorted_c=sorted_c,
+        sum_c=sum_c,
+        ss_c=ss_c,
+        len_c=len_c,
+    )
+
+
+def _run_winsorized_rolling(
+    df: pl.DataFrame,
+    index_col: str,
+    val_col: str,
+    group_by: str | None,
+    window: str | None,
+    window_size: int | None,
+    plan: _WinsorPlan,
+    idx_dtype: pl.DataType,
+    val_dtype: pl.DataType,
+) -> pl.DataFrame:
+    """Run the ``rolling().agg().with_columns()`` pipeline.
+
+    Handles both time-based (``window``) and count-based (``window_size``)
+    modes, narrowing + sorting the frame first, and wrapping the polars
+    call in a try/except that chains the original exception with input-
+    parameter context.
+    """
+    # rolling() requires the frame to be monotonic by (group_by, index_col);
+    # the defensive sort happens inside the try/except below so any failure
+    # (sort comparison panic, etc.) is surfaced with input-parameter context.
+    sort_keys = [group_by, index_col] if group_by else [index_col]
+
+    # u32 row-index overflow guard (count-based path only).
+    # polars.DataFrame.with_row_index produces a UInt32 column by default
+    # (confirmed against the installed polars version). A frame with more
+    # than 2**32 - 1 rows would overflow or panic deep inside the pipeline;
+    # reject up front with an actionable message so the caller can switch
+    # to the time-based window or chunk the input.
+    _U32_MAX = 2**32 - 1
+    if window_size is not None and df.height > _U32_MAX:
+        raise ValueError(
+            f"winsorized_rolling_stats: df has {df.height:,} rows, which "
+            f"exceeds the u32 row-index maximum ({_U32_MAX:,}) used by the "
+            f"count-based window_size path. Use the time-based 'window' "
+            f"parameter instead, or pre-chunk the input."
+        )
+
+    # Wrap the polars pipeline: despite upstream validation, polars can still
+    # raise ComputeError / SchemaError / PanicException / version-specific
+    # exceptions from inside rolling/agg/with_columns. Re-raise with context
+    # so the caller sees which inputs triggered the failure rather than a
+    # deep-stack polars internal error.
+    try:
+        # Narrow df to only the columns this function actually reads before
+        # sorting. Reasons:
+        #   * The caller's df may have unrelated columns with pathological
+        #     dtypes (Object holding unhashable Python objects, Categorical
+        #     without a string cache, deeply-nested Structs) that would make
+        #     sort/rolling copy-of-all fail or panic, even though we never
+        #     use those columns.
+        #   * Halves memory overhead on wide DataFrames — sort materializes
+        #     a full copy, so narrowing first is cheaper.
+        # rolling().agg() only preserves index_col + group_by + agg columns
+        # anyway, so output semantics are identical.
+        df = df.select([*sort_keys, val_col]).sort(sort_keys)
+        row_idx_c = f"{plan.tag}_rowidx"
+        if window_size is not None:
+            # Count-based: build a per-group contiguous integer row index
+            # (global `with_row_index` after sort gives each group a
+            # contiguous monotonic range, which is what polars rolling
+            # requires as its index column). We rejoin the agg output on
+            # this index so the original index_col is preserved unchanged.
+            df = df.with_row_index(name=row_idx_c)
+            rolling_period: str = f"{window_size}i"
+            rolling_index = row_idx_c
+        else:
+            # Runtime re-check rather than `assert`: survives `python -O`
+            # (which strips asserts), so a future refactor that weakens
+            # API-level validation cannot silently pass `None` as the
+            # rolling period. Unreachable under normal flow.
+            if window is None:
+                raise RuntimeError(
+                    "winsorized_rolling_stats: internal invariant violated "
+                    "— window is None in the time-based branch"
+                )
+            rolling_period = window
+            rolling_index = index_col
+        result = (
+            df.rolling(index_column=rolling_index, period=rolling_period, group_by=group_by)
+            .agg(**{
+                plan.sorted_c: plan.val_expr.drop_nulls().sort(),
+                plan.sum_c: plan.val_expr.sum(),
+                plan.ss_c: (plan.val_expr * plan.val_expr).sum(),
+            })
+            .with_columns(**{plan.len_c: pl.col(plan.sorted_c).list.len()})
+            .with_columns(
+                winsorized_mean=plan.mean_final,
+                winsorized_std=plan.std_final,
+            )
+            .drop([plan.sorted_c, plan.len_c, plan.sum_c, plan.ss_c])
+        )
+        if window_size is not None:
+            # Rejoin the preserved index_col from the sorted input frame
+            # via the row-index key, then drop the synthetic index.
+            result = (
+                result
+                .join(df.select(row_idx_c, index_col), on=row_idx_c, how="left")
+                .drop(row_idx_c)
+            )
+
+        # Canonical column ordering:
+        #   [group_by (if present), index_col, winsorized_mean, winsorized_std].
+        # The count-based path rejoins index_col at the end, so its
+        # natural order differs from the time-based path. A positional
+        # consumer would silently receive two different schemas depending
+        # on which mode was selected; normalize here so both paths are
+        # contract-identical. The select also trims any column that
+        # somehow survived the earlier `.drop(...)` (e.g. a polars
+        # behavior change), turning a silent leak into an explicit
+        # ColumnNotFoundError caught by the except wrap below.
+        canonical_cols = (
+            ([group_by] if group_by is not None else [])
+            + [index_col, "winsorized_mean", "winsorized_std"]
+        )
+        result = result.select(canonical_cols)
+    except Exception as e:
+        raise RuntimeError(
+            f"winsorized_rolling_stats: polars rolling pipeline failed "
+            f"(index_col={index_col!r}, val_col={val_col!r}, "
+            f"window={window!r}, group_by={group_by!r}, "
+            f"n_rows={df.height}, index_dtype={idx_dtype}, "
+            f"val_dtype={val_dtype}). Underlying error: "
+            f"{type(e).__name__}: {e}"
+        ) from e
+
+    return result
+
+
+def _verify_winsorized_output(
+    result: pl.DataFrame,
+    input_height: int,
+    index_col: str,
+    val_col: str,
+    group_by: str | None,
+    window: str | None,
+) -> None:
+    """Post-condition checks — rolling().agg() is a 1:1 row-wise op.
+
+    Catching a mismatch turns a silent-corruption failure (joins-on-index
+    quietly go wrong) into a clear error, and guards against future polars
+    behavior changes. Every error includes the same input-parameter
+    context so the caller always gets the full picture regardless of
+    which specific guard tripped.
+    """
+    _ctx = (
+        f"index_col={index_col!r}, val_col={val_col!r}, "
+        f"window={window!r}, group_by={group_by!r}, "
+        f"input_height={input_height}"
+    )
+
+    # Type post-condition: a future polars version might change rolling().agg()
+    # to return a LazyFrame (or some wrapper) — without this check, the
+    # subsequent .height access would raise a cryptic AttributeError from the
+    # post-condition code itself, masking the actual semantic change.
+    if not isinstance(result, pl.DataFrame):
+        raise RuntimeError(
+            f"winsorized_rolling_stats: expected pl.DataFrame output from "
+            f"rolling pipeline, got {type(result).__name__}; polars API may "
+            f"have changed ({_ctx})"
+        )
+    if result.height != input_height:
+        raise RuntimeError(
+            f"winsorized_rolling_stats: output row count {result.height} "
+            f"does not match input {input_height}; polars may have dropped "
+            f"or duplicated rows ({_ctx})"
+        )
+    # Full-schema post-condition: result columns must be EXACTLY the
+    # expected set (group_by if any, index_col, the two stat columns).
+    # A narrower "missing stats only" check would miss two silent-
+    # corruption modes: (a) index_col or group_by dropped by a future
+    # polars change in rolling().agg() semantics, and (b) an internal
+    # __wrs_* column leaking past the earlier `.drop(...)` and the
+    # canonical `.select(...)` in _run_winsorized_rolling.
+    expected_cols = {"winsorized_mean", "winsorized_std", index_col}
+    if group_by is not None:
+        expected_cols.add(group_by)
+    actual_cols = set(result.columns)
+    if actual_cols != expected_cols:
+        missing_cols = expected_cols - actual_cols
+        extra_cols = actual_cols - expected_cols
+        raise RuntimeError(
+            f"winsorized_rolling_stats: unexpected output schema — "
+            f"missing={sorted(missing_cols)!r}, extra={sorted(extra_cols)!r}; "
+            f"expected {sorted(expected_cols)!r}, got {result.columns} "
+            f"({_ctx})"
+        )
+    # Dtype post-condition: both stat columns must be Float64 (the cast
+    # target) or Null (only possible when result is empty and polars
+    # couldn't infer from zero rows). Anything else would silently break
+    # downstream numeric ops like .cast(Float64) / arithmetic.
+    for _out in ("winsorized_mean", "winsorized_std"):
+        _out_dtype = result.schema[_out]
+        if not isinstance(_out_dtype, (pl.Float64, pl.Null)):
+            raise RuntimeError(
+                f"winsorized_rolling_stats: output column {_out!r} has "
+                f"unexpected dtype {_out_dtype}; expected Float64 "
+                f"(or Null for an empty result) ({_ctx})"
+            )
+
+    # Finiteness post-condition: mean_final / std_final gate every branch
+    # on `.is_finite()`, so any non-null output value MUST be finite. A
+    # leaked NaN or ±Inf would indicate a polars is_finite regression
+    # (or a bug in the gating plan) and would silently corrupt downstream
+    # aggregations like portfolio variance / z-score. Catch it here
+    # instead of propagating. Skip the scan on empty (Null-dtype) columns
+    # — there is nothing to check.
+    for _out in ("winsorized_mean", "winsorized_std"):
+        if isinstance(result.schema[_out], pl.Float64):
+            n_non_finite = result.select(
+                (pl.col(_out).is_not_null() & ~pl.col(_out).is_finite()).sum()
+            ).item()
+            if n_non_finite:
+                raise RuntimeError(
+                    f"winsorized_rolling_stats: {n_non_finite} non-finite "
+                    f"value(s) leaked into output column {_out!r} despite "
+                    f"the is_finite gate in the expression plan; possible "
+                    f"polars regression ({_ctx})"
+                )
+
+
 def winsorized_rolling_stats(
     df: pl.DataFrame,
     index_col: str,
@@ -456,353 +1605,43 @@ def winsorized_rolling_stats(
         * window unit mismatches the index_col dtype
         * group_by contains null values
         * index_col / group_by collide with the output column names
+        * window_size path is used with df.height > 2**32 - 1 (u32
+          row-index overflow)
     RuntimeError
         * the polars rolling pipeline raises any other error; the original
           exception is chained via `__cause__` and the message includes
           the input parameters for diagnosis
         * the pipeline returns a non-DataFrame object, output row count
           does not match input row count, one of the expected output
-          columns is missing, or an output column has an unexpected dtype
+          columns is missing, an output column has an unexpected dtype,
+          or a non-finite (NaN/Inf) value leaks past the is_finite gate
           (silent-corruption guards)
     """
     # ── Input validation at the API boundary ────────────────────────────
-    if not isinstance(df, pl.DataFrame):
-        raise TypeError(
-            f"df must be polars.DataFrame, got {type(df).__name__}"
-        )
-    for arg_name, arg_val in (
-        ("index_col", index_col),
-        ("val_col", val_col),
-    ):
-        if not isinstance(arg_val, str) or not arg_val:
-            raise TypeError(
-                f"{arg_name} must be a non-empty string, got {arg_val!r}"
-            )
-    if group_by is not None and (not isinstance(group_by, str) or not group_by):
-        raise TypeError(
-            f"group_by must be None or a non-empty string, got {group_by!r}"
-        )
-
-    # Exactly one of window / window_size must be provided.
-    if (window is None) == (window_size is None):
-        raise ValueError(
-            "exactly one of window (duration string) or window_size "
-            "(positive int, count-based) must be provided; got "
-            f"window={window!r}, window_size={window_size!r}"
-        )
-    if window is not None and (not isinstance(window, str) or not window):
-        raise TypeError(
-            f"window must be a non-empty string, got {window!r}"
-        )
-    if window_size is not None:
-        if not isinstance(window_size, int) or isinstance(window_size, bool) or window_size <= 0:
-            raise ValueError(
-                f"window_size must be a positive int, got {window_size!r}"
-            )
-    if not isinstance(min_samples, int) or isinstance(min_samples, bool) or min_samples < 1:
-        raise ValueError(
-            f"min_samples must be a positive int, got {min_samples!r}"
-        )
-    if window_size is not None and min_samples > window_size:
-        raise ValueError(
-            f"min_samples ({min_samples}) must be <= window_size ({window_size})"
-        )
-
-    required_cols = [index_col, val_col] + ([group_by] if group_by else [])
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"Column(s) not found in df: {missing}. "
-            f"Available: {df.columns}"
-        )
-
-    # Aliased column names (e.g. group_by == index_col) would make rolling()
-    # produce a duplicate-column error or silently mis-aggregate. Reject here.
-    if len(set(required_cols)) != len(required_cols):
-        raise ValueError(
-            f"index_col, val_col, and group_by must all be distinct; got "
-            f"index_col={index_col!r}, val_col={val_col!r}, "
-            f"group_by={group_by!r}"
-        )
-
-    val_dtype = df.schema[val_col]
-    if not val_dtype.is_numeric() or isinstance(val_dtype, pl.Boolean):
-        raise TypeError(
-            f"val_col {val_col!r} must be a numeric (non-Boolean) dtype, "
-            f"got {val_dtype}"
-        )
-
-    # polars.DataFrame.rolling() only supports Integer, Date, or Datetime
-    # index columns (a monotonic timeline). Time and Duration pass the
-    # general is_temporal() gate but are rejected by rolling() with an
-    # opaque error; restrict to the officially supported set up front.
-    idx_dtype = df.schema[index_col]
-    idx_ok = idx_dtype.is_integer() or isinstance(idx_dtype, (pl.Date, pl.Datetime))
-    if not idx_ok:
-        raise TypeError(
-            f"index_col {index_col!r} must be an integer, Date, or Datetime "
-            f"dtype; got {idx_dtype} (Time and Duration are not supported)"
-        )
-    if df[index_col].null_count() > 0:
-        raise ValueError(
-            f"index_col {index_col!r} contains null values; rolling windows "
-            f"require a non-null monotonic index"
-        )
-
-    # Validate the window string format, then cross-check its unit against
-    # the index dtype. Polars accepts compound durations like "1d12h", plus
-    # the integer-index unit "i". Catching the malformed/mismatched cases
-    # here turns opaque mid-plan parse errors into actionable messages.
+    _validate_winsorized_args(
+        df, index_col, val_col, group_by, window, window_size, min_samples,
+    )
+    idx_dtype, val_dtype = _validate_winsorized_schema(
+        df, index_col, val_col, group_by,
+    )
     if window is not None:
-        _units_re = re.compile(r"(ns|us|ms|mo|[smhdwqyi])")
-        _window_components_re = re.compile(r"(\d+)(ns|us|ms|mo|[smhdwqyi])")
-        if not re.fullmatch(r"(\d+(ns|us|ms|mo|[smhdwqyi]))+", window):
-            raise ValueError(
-                f"window {window!r} is not a valid polars duration string; "
-                f"expected e.g. '30s', '5m', '1d', '1mo', '10i' (or compound "
-                f"forms like '1d12h')"
-            )
-        # Zero-magnitude windows ("0s", "0i", "0d0h") trigger a deep polars
-        # "window must be positive" error; catch it here.
-        if all(int(mag) == 0 for mag, _ in _window_components_re.findall(window)):
-            raise ValueError(
-                f"window {window!r} has zero total magnitude; rolling windows "
-                f"must be strictly positive"
-            )
-        window_units = _units_re.findall(window)
-        if idx_dtype.is_integer():
-            if any(u != "i" for u in window_units):
-                raise ValueError(
-                    f"window {window!r} uses temporal units but index_col "
-                    f"{index_col!r} is integer ({idx_dtype}); use an "
-                    f"'i'-suffixed window like '10i'"
-                )
-        else:
-            if "i" in window_units:
-                raise ValueError(
-                    f"window {window!r} uses the integer unit 'i' but index_col "
-                    f"{index_col!r} is temporal ({idx_dtype}); use duration "
-                    f"units like 's', 'm', 'h', 'd', 'mo'"
-                )
+        _validate_winsorized_window_string(window, index_col, idx_dtype)
 
-    # group_by column dtype must be groupable; nested/object dtypes cause
-    # polars to error inside rolling() with an opaque message.
-    if group_by is not None:
-        gb_dtype = df.schema[group_by]
-        if isinstance(gb_dtype, (pl.List, pl.Struct, pl.Array, pl.Object)):
-            raise TypeError(
-                f"group_by {group_by!r} has dtype {gb_dtype}, which is not "
-                f"groupable; use a scalar dtype (Int/Utf8/Categorical/Date/…)"
-            )
-        # Polars silently lumps all null group keys together, which is
-        # almost never what the caller wants; fail loudly instead.
-        if df[group_by].null_count() > 0:
-            raise ValueError(
-                f"group_by {group_by!r} contains null values; drop or fill "
-                f"them before calling (polars would otherwise group all "
-                f"nulls into a single bucket)"
-            )
-
-    # Output-column collision: rolling().agg() preserves index_col and
-    # group_by in the output. If either is named "winsorized_mean" or
-    # "winsorized_std", the final with_columns() would silently overwrite
-    # it — a genuine silent-corruption risk. Reject up front.
-    _output_cols = {"winsorized_mean", "winsorized_std"}
-    _reserved_conflict = _output_cols.intersection(
-        {index_col, group_by} - {None}
-    )
-    if _reserved_conflict:
-        raise ValueError(
-            f"index_col/group_by cannot be named {sorted(_reserved_conflict)!r}; "
-            f"those names are reserved for this function's output columns"
-        )
-
-    # Collision-proof internal column names — a caller's df may already
-    # have a column literally called "_sorted", "_sum", etc.
-    tag = f"__wrs_{uuid.uuid4().hex[:8]}"
-    sorted_c, sum_c, ss_c, len_c = (
-        f"{tag}_sorted", f"{tag}_sum", f"{tag}_ss", f"{tag}_len",
-    )
-
-    # Cast val_col to Float64 up-front, then neutralize non-finite inputs:
-    #   * Float64 avoids silent integer overflow in x*x / sum-of-squares
-    #   * mapping ±Inf/NaN to null keeps them out of min/max, which would
-    #     otherwise make a single infinity contaminate w_sum / w_ss via
-    #     Inf - Inf = NaN and mask the entire window's output as None.
-    #   * a null row stays excluded by drop_nulls() and by sum()'s null-skip
-    #     semantics, so the rest of the window still produces valid stats.
-    _raw = pl.col(val_col).cast(pl.Float64, strict=True)
-    val_expr = pl.when(_raw.is_finite()).then(_raw).otherwise(None)
-
-    # rolling() requires the frame to be monotonic by (group_by, index_col);
-    # the defensive sort happens inside the try/except below so any failure
-    # (sort comparison panic, etc.) is surfaced with input-parameter context.
-    sort_keys = [group_by, index_col] if group_by else [index_col]
-
-    # Shorthand Expressions
-    s = pl.col(sorted_c)
-    n = pl.col(len_c)
-    raw_sum = pl.col(sum_c)
-    raw_ss = pl.col(ss_c)
-
-    # Get the 1st and 2nd lowest and highest values, with nulls for out-of-bounds
-    lo, lo2 = s.list.get(0, null_on_oob=True), s.list.get(1, null_on_oob=True)
-    hi, hi2 = s.list.get(-1, null_on_oob=True), s.list.get(-2, null_on_oob=True)
-
-    w_sum = raw_sum - lo - hi + lo2 + hi2
-    w_ss = raw_ss - lo * lo - hi * hi + lo2 * lo2 + hi2 * hi2
-
-    mean_big = w_sum / n
-    # Clamp at 0 before sqrt: catastrophic cancellation on near-constant
-    # windows can make the numerator a tiny negative, which sqrt turns to NaN.
-    var_big = ((w_ss - n * mean_big * mean_big) / (n - 1)).clip(lower_bound=0)
-
-    mean_small = raw_sum / n
-    var_small = ((raw_ss - n * mean_small * mean_small) / (n - 1)).clip(lower_bound=0)
-
-    # Gate every branch on the minimum n required so disallowed sizes hit
-    # `otherwise(None)` instead of computing 0/0 (NaN) or a degenerate value.
-    # min_samples raises the floor on top of the intrinsic per-branch minima
-    # (3 for winsorized, 1/2 for the small-window fallbacks).
-    gate_big = max(3, min_samples)
-    gate_mean_small = max(1, min_samples)
-    gate_std_small = max(2, min_samples)
-    mean_expr = (
-        pl.when(n >= gate_big).then(mean_big)
-        .when(n >= gate_mean_small).then(mean_small)
-        .otherwise(None)
-    )
-    std_expr = (
-        pl.when(n >= gate_big).then(var_big.sqrt())
-        .when(n >= gate_std_small).then(var_small.sqrt())
-        .otherwise(None)
-    )
-
-    # Final guard: any residual NaN or ±Inf (e.g. overflow on extreme inputs,
-    # or non-finite values leaking in from val_col) becomes None.
-    mean_final = pl.when(mean_expr.is_finite()).then(mean_expr).otherwise(None)
-    std_final = pl.when(std_expr.is_finite()).then(std_expr).otherwise(None)
+    # ── Build expressions, then execute the rolling pipeline ────────────
+    plan = _build_winsorized_plan(val_col, min_samples)
 
     # Capture the caller's row count BEFORE sort/rolling so the post-condition
     # compares against the true input height. Reading df.height after the
-    # in-try reassignment would compare two equally-wrong heights if sort
+    # in-pipeline narrowing would compare two equally-wrong heights if sort
     # itself had silently dropped or duplicated rows.
     input_height = df.height
-
-    # Wrap the polars pipeline: despite upstream validation, polars can still
-    # raise ComputeError / SchemaError / PanicException / version-specific
-    # exceptions from inside rolling/agg/with_columns. Re-raise with context
-    # so the caller sees which inputs triggered the failure rather than a
-    # deep-stack polars internal error.
-    try:
-        # Narrow df to only the columns this function actually reads before
-        # sorting. Reasons:
-        #   * The caller's df may have unrelated columns with pathological
-        #     dtypes (Object holding unhashable Python objects, Categorical
-        #     without a string cache, deeply-nested Structs) that would make
-        #     sort/rolling copy-of-all fail or panic, even though we never
-        #     use those columns.
-        #   * Halves memory overhead on wide DataFrames — sort materializes
-        #     a full copy, so narrowing first is cheaper.
-        # rolling().agg() only preserves index_col + group_by + agg columns
-        # anyway, so output semantics are identical.
-        df = df.select([*sort_keys, val_col]).sort(sort_keys)
-        row_idx_c = f"{tag}_rowidx"
-        if window_size is not None:
-            # Count-based: build a per-group contiguous integer row index
-            # (global `with_row_index` after sort gives each group a
-            # contiguous monotonic range, which is what polars rolling
-            # requires as its index column). We rejoin the agg output on
-            # this index so the original index_col is preserved unchanged.
-            df = df.with_row_index(name=row_idx_c)
-            rolling_period: str = f"{window_size}i"
-            rolling_index = row_idx_c
-        else:
-            assert window is not None  # validated above
-            rolling_period = window
-            rolling_index = index_col
-        result = (
-            df.rolling(index_column=rolling_index, period=rolling_period, group_by=group_by)
-            .agg(**{
-                sorted_c: val_expr.drop_nulls().sort(),
-                sum_c: val_expr.sum(),
-                ss_c: (val_expr * val_expr).sum(),
-            })
-            .with_columns(**{len_c: pl.col(sorted_c).list.len()})
-            .with_columns(
-                winsorized_mean=mean_final,
-                winsorized_std=std_final,
-            )
-            .drop([sorted_c, len_c, sum_c, ss_c])
-        )
-        if window_size is not None:
-            # Rejoin the preserved index_col from the sorted input frame
-            # via the row-index key, then drop the synthetic index.
-            result = (
-                result
-                .join(df.select(row_idx_c, index_col), on=row_idx_c, how="left")
-                .drop(row_idx_c)
-            )
-    except Exception as e:
-        raise RuntimeError(
-            f"winsorized_rolling_stats: polars rolling pipeline failed "
-            f"(index_col={index_col!r}, val_col={val_col!r}, "
-            f"window={window!r}, group_by={group_by!r}, "
-            f"n_rows={df.height}, index_dtype={idx_dtype}, "
-            f"val_dtype={val_dtype}). Underlying error: "
-            f"{type(e).__name__}: {e}"
-        ) from e
-
-    # Post-condition checks — rolling().agg() is a 1:1 row-wise operation,
-    # not a group-by collapse, so height must match input and the two named
-    # output columns must be present. Catching a mismatch turns a silent-
-    # corruption failure (joins-on-index quietly go wrong) into a clear
-    # error, and guards against future polars behavior changes.
-    #
-    # Every post-condition error includes the same input-parameter context
-    # so a caller debugging a silent-corruption path always gets the full
-    # picture regardless of which specific guard tripped.
-    _ctx = (
-        f"index_col={index_col!r}, val_col={val_col!r}, "
-        f"window={window!r}, group_by={group_by!r}, "
-        f"input_height={input_height}"
+    result = _run_winsorized_rolling(
+        df, index_col, val_col, group_by, window, window_size,
+        plan, idx_dtype, val_dtype,
     )
-
-    # Type post-condition: a future polars version might change rolling().agg()
-    # to return a LazyFrame (or some wrapper) — without this check, the
-    # subsequent .height access would raise a cryptic AttributeError from the
-    # post-condition code itself, masking the actual semantic change.
-    if not isinstance(result, pl.DataFrame):
-        raise RuntimeError(
-            f"winsorized_rolling_stats: expected pl.DataFrame output from "
-            f"rolling pipeline, got {type(result).__name__}; polars API may "
-            f"have changed ({_ctx})"
-        )
-    if result.height != input_height:
-        raise RuntimeError(
-            f"winsorized_rolling_stats: output row count {result.height} "
-            f"does not match input {input_height}; polars may have dropped "
-            f"or duplicated rows ({_ctx})"
-        )
-    missing_out = {"winsorized_mean", "winsorized_std"} - set(result.columns)
-    if missing_out:
-        raise RuntimeError(
-            f"winsorized_rolling_stats: output is missing expected "
-            f"column(s) {sorted(missing_out)!r}; got {result.columns} "
-            f"({_ctx})"
-        )
-    # Dtype post-condition: both stat columns must be Float64 (the cast
-    # target) or Null (only possible when result is empty and polars
-    # couldn't infer from zero rows). Anything else would silently break
-    # downstream numeric ops like .cast(Float64) / arithmetic.
-    for _out in ("winsorized_mean", "winsorized_std"):
-        _out_dtype = result.schema[_out]
-        if not isinstance(_out_dtype, (pl.Float64, pl.Null)):
-            raise RuntimeError(
-                f"winsorized_rolling_stats: output column {_out!r} has "
-                f"unexpected dtype {_out_dtype}; expected Float64 "
-                f"(or Null for an empty result) ({_ctx})"
-            )
+    _verify_winsorized_output(
+        result, input_height, index_col, val_col, group_by, window,
+    )
     return result
 
 #################################################################################################

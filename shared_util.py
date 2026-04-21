@@ -48,14 +48,11 @@ def parse_arguments(
 ) -> tuple[datetime.date, datetime.date, str]:
 
     # ── Step 1: Detect execution mode ────────────────────────────────────
-    # Jupyter/IPython loads 'ipykernel'; CLI scripts have sys.argv[0] ending in '.py'.
-    # In interactive mode argparse would choke on notebook/IDE argv, so we skip it.
-    # Guard against empty sys.argv (embedded CPython, some test runners that
-    # monkeypatch argv, or odd dynamic-exec setups).  Index access on an
-    # empty list would IndexError at init before any pipeline logic runs.
-    is_interactive = "ipykernel" in sys.modules or not (
-        sys.argv and sys.argv[0].endswith(".py")
-    )
+    # Detect Jupyter/IPython ('ipykernel') or standard REPL (sys.ps1).
+    # Avoid checking sys.argv[0].endswith(".py") as it incorrectly categorizes
+    # execution via `python -m`, PyInstaller (.exe), or script wrappers (.exe/.sh)
+    # as interactive, which would silently swallow CLI arguments.
+    is_interactive = hasattr(sys, "ps1") or "ipykernel" in sys.modules
 
     # ── Step 2: Obtain raw string inputs ─────────────────────────────────
     if is_interactive:
@@ -1685,8 +1682,20 @@ def plot_time_series(
         ax_right.set_ylim(ax.get_ylim())
 
         plt.subplots_adjust(right=0.6)
-        plt.show()
-        plt.close()
+        # Only render interactively when matplotlib is in interactive mode
+        # (Jupyter %matplotlib inline, IPython --pylab, etc.).  In batch
+        # scripts the default is non-interactive, and calling plt.show()
+        # against a GUI backend (TkAgg/Qt5Agg) on headless Linux either
+        # raises (no DISPLAY) or blocks waiting for the window to close —
+        # silently hanging cron jobs.  Under Agg it would already be a
+        # no-op, so gating here is strictly a headless-Linux safety net.
+        if plt.isinteractive():
+            plt.show()
+        # Close the specific figure we just created.  plt.close() with no
+        # argument closes pyplot's *current* figure, which may not be
+        # ``fig`` if any other figure was created between the subplots
+        # call and here.  Explicit fig avoids that footgun.
+        plt.close(fig)
         return fig
     except Exception:
         plt.close(fig)
@@ -1817,7 +1826,7 @@ def save_matplotlib_charts_as_html(
         "</head><body>",
         f"<h1>{safe_prefix} — Charts</h1>",
         f"<p style='color:#666;font-size:0.9em;'>Generated: "
-        f"{datetime.datetime.now(tz=zoneinfo.ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')} US Eastern</p>",
+        f"{datetime.datetime.now(tz=_REPORT_TZ).strftime('%Y-%m-%d %H:%M:%S')} {_REPORT_TZ_LABEL}</p>",
     ]
 
     for i, fig in enumerate(figures):
@@ -1893,16 +1902,33 @@ _LOCK_TIMEOUT_SECONDS: int = 600
 ## < > : " / \ | ? * and ASCII control characters 0x00-0x1F
 _WINDOWS_ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
-## Windows reserved device names: CON, PRN, AUX, NUL, COM1-9, LPT1-9.
-## These are forbidden as basenames regardless of extension (CON.parquet hangs).
+## Windows reserved device names: CON, PRN, AUX, NUL, COM0-9, LPT0-9.
+## Forbidden as basenames regardless of extension (CON.parquet hangs).
+## Per Microsoft's current "Naming Files, Paths, and Namespaces" doc the
+## reserved numeric ranges are 0-9 (not 1-9) — COM0 and LPT0 were added
+## to the modern list and also reserve the device namespace on Windows 10+.
 _WINDOWS_RESERVED_NAMES = re.compile(
-    r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.IGNORECASE
+    r"^(con|prn|aux|nul|com[0-9]|lpt[0-9])$", re.IGNORECASE
 )
 
 ## Safe errno access: these POSIX constants may be absent on some Windows Python builds.
 ## Using -1 as sentinel ensures they never accidentally match a real errno value.
 _ESTALE: int = getattr(errno, "ESTALE", -1)  # NFS stale file handle
 _ETXTBSY: int = getattr(errno, "ETXTBSY", -1)  # Text file busy
+
+
+## IANA tz database lookup for report timestamps.  Linux distros ship the
+## tzdb system-wide, but Windows does not — stdlib ``zoneinfo`` on Windows
+## requires the ``tzdata`` PyPI package (``pip install tzdata``) to resolve
+## names like "America/New_York".  Resolve once at module load and fall back
+## to UTC with an unambiguous label so HTML reports still generate in
+## degraded environments rather than crashing inside save_matplotlib_charts_as_html.
+try:
+    _REPORT_TZ: datetime.tzinfo = zoneinfo.ZoneInfo("America/New_York")
+    _REPORT_TZ_LABEL: str = "US Eastern"
+except zoneinfo.ZoneInfoNotFoundError:
+    _REPORT_TZ = datetime.timezone.utc
+    _REPORT_TZ_LABEL = "UTC (install 'tzdata' for US Eastern on Windows)"
 
 
 def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) -> None:
@@ -2347,7 +2373,7 @@ def _fsync_and_verify_size(tmp_path: str) -> int:
     tmp_size = -1
     for _fsync_attempt in range(12):
         try:
-            fd = os.open(tmp_path, os.O_RDWR)
+            fd = os.open(tmp_path, os.O_RDWR | getattr(os, "O_BINARY", 0))
             try:
                 os.fsync(fd)
                 tmp_size = os.fstat(fd).st_size
@@ -2576,8 +2602,8 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
             Path(tmp_path).replace(file_path)
             return
         except OSError as e:
-            win_err = getattr(e, "winerror", None)
-            posix_err = getattr(e, "errno", None)
+            win_err = getattr(e, "winerror", 0)
+            posix_err = getattr(e, "errno", 0)
             if win_err not in (5, 32, 33) and posix_err not in (
                 errno.EACCES,
                 errno.EBUSY,
@@ -2626,7 +2652,7 @@ def _verify_written_size(file_path: str, expected_size: int) -> None:
     written_size = -1
     for _verify_attempt in range(12):
         try:
-            fd = os.open(file_path, os.O_RDONLY)
+            fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
             try:
                 written_size = os.fstat(fd).st_size
             finally:

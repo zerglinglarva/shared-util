@@ -1,8 +1,11 @@
 #################################################################################################
 # Import Libraries
 import argparse
+import base64
 import datetime
 import errno
+import html
+import io
 import logging
 import os
 import re
@@ -116,7 +119,7 @@ def parse_arguments(
         )
 
     # ── Step 4: Resolve write directory from the mode string ─────────────
-    # Guard against empty folder strings before resolving.  os.path.realpath("")
+    # Guard against empty folder strings before resolving.  Path("").resolve()
     # returns the current working directory, so an empty dev_folder/prod_folder
     # would silently pass the isdir check and write files to the wrong location.
     if not dev_folder or not dev_folder.strip():
@@ -138,7 +141,7 @@ def parse_arguments(
     # Resolve to absolute path so the returned directory remains valid even if
     # the caller changes the working directory before using it (same guard as
     # lazy_parquet applies to folder_path).
-    write_directory = os.path.realpath(write_directory)
+    write_directory = str(Path(write_directory).resolve())
 
     # Fail early if the resolved directory doesn't exist on disk
     if not Path(write_directory).is_dir():
@@ -283,17 +286,7 @@ def _mtd_load_calendars_and_tz(
             f"have no timezone"
         )
 
-    tz_labels: set[str] = set()
-    for v, t in zip(unique_venues, tzs, strict=True):
-        try:
-            tz_labels.add(str(t))
-        except Exception as e:
-            # A pathological ``__str__`` should name the offending
-            # calendar, not bubble up a bare TypeError.
-            raise ValueError(
-                f"compute_mtd_date_range: failed to stringify tz for "
-                f"venue {v!r}: {e!s}"
-            ) from e
+    tz_labels = {str(t) for t in tzs}
     if len(tz_labels) != 1:
         raise ValueError(
             f"compute_mtd_date_range: venues span multiple timezones "
@@ -330,21 +323,8 @@ def _mtd_load_calendars_and_tz(
 
 
 def _mtd_now_local(tz: datetime.tzinfo) -> datetime.datetime:
-    """Return ``datetime.now(tz=tz)`` with a domain-wrapped failure.
-
-    A pathological but isinstance-passing tzinfo subclass (broken
-    utcoffset / fromutc, or a test double) can crash inside CPython's
-    datetime.now C implementation. Wrap so callers see a coherent
-    RuntimeError instead of an opaque stdlib traceback.
-    """
-    try:
-        return datetime.datetime.now(tz=tz)
-    except Exception as e:
-        raise RuntimeError(
-            f"compute_mtd_date_range: failed to compute current local time "
-            f"from calendar tz={tz!r} ({type(tz).__name__}): "
-            f"{type(e).__name__}: {e!s}"
-        ) from e
+    """Return ``datetime.now(tz=tz)``. ``tz`` is isinstance-validated upstream."""
+    return datetime.datetime.now(tz=tz)
 
 
 def _mtd_make_session_probe(
@@ -359,30 +339,6 @@ def _mtd_make_session_probe(
     fault" from "genuine long closure" without spamming logs on every
     OOB probe. ``all`` for intersect, ``any`` for union.
     """
-    # Defensive: empty ``cals`` would cause ``all(())`` → True under
-    # intersect (silently marking every date a session → wrong answer)
-    # and ``any(())`` → False under union (silently marking every date
-    # a non-session → 30-day exhaustion error). The orchestrator's
-    # calendar-loader guarantees non-empty cals, but this helper is
-    # private-yet-reachable via direct import; fail fast here against
-    # future refactors or test harnesses that bypass the orchestrator.
-    if not cals:
-        raise RuntimeError(
-            "compute_mtd_date_range: _mtd_make_session_probe requires a "
-            "non-empty cals list"
-        )
-    # Same defense-in-depth for combine_type: a direct caller with
-    # ``combine_type="Intersect"`` (wrong case) or an unexpected string
-    # would silently fall back to ``any`` (union semantics) in the
-    # ternary below — a silent-wrong-answer under an "intersect" label.
-    # The orchestrator already validates via ``_mtd_validate_inputs``,
-    # but helpers re-checking their own preconditions is cheap insurance.
-    if combine_type not in ("union", "intersect"):
-        raise ValueError(
-            f"compute_mtd_date_range: _mtd_make_session_probe combine_type "
-            f"must be 'union' or 'intersect', got {combine_type!r}"
-        )
-
     probe_errors: list[BaseException] = []
     combine_fn = all if combine_type == "intersect" else any
 
@@ -543,47 +499,19 @@ def _mtd_find_enddate(
     On exhaustion, surface the last probe exception in the error so
     operators can tell a library fault apart from a genuine long closure.
     """
-    try:
-        # Guard against ``today == date.min`` (pathological mocked clock
-        # / epoch-fallback env): subtracting a day would raise
-        # OverflowError; convert to a domain RuntimeError.
-        probe = today if include_today else today - datetime.timedelta(days=1)
-    except OverflowError as e:
-        raise RuntimeError(
-            f"compute_mtd_date_range: date underflow computing initial "
-            f"probe from today={today}"
-        ) from e
+    probe = today if include_today else today - datetime.timedelta(days=1)
     for _ in range(max_lookback):
         if is_target_session(probe):
             return probe
-        try:
-            probe -= datetime.timedelta(days=1)
-        except OverflowError as e:
-            raise RuntimeError(
-                f"compute_mtd_date_range: date underflow during lookback "
-                f"from today={today} (probe reached {probe})"
-            ) from e
+        probe -= datetime.timedelta(days=1)
 
-    # Build the hint defensively: a hostile exception (custom
-    # ``__str__`` that raises) would otherwise cause the f-string to
-    # fail *during RuntimeError construction*, masking the load-bearing
-    # "no session found" diagnostic with a meaningless format-error
-    # traceback. Fall back to a bare count if stringification fails.
     hint = ""
     if probe_errors:
         last = probe_errors[-1]
-        try:
-            last_str = str(last)
-        except Exception:
-            last_str = "<exception __str__ raised>"
-        try:
-            last_type = type(last).__name__
-        except Exception:
-            last_type = "<unknown>"
         hint = (
             f"; {len(probe_errors)} of {max_lookback} probe(s) raised — "
-            f"last was {last_type}: {last_str} (possible calendar-library "
-            f"fault rather than long closure)"
+            f"last was {type(last).__name__}: {last} (possible calendar-"
+            f"library fault rather than long closure)"
         )
     raise RuntimeError(
         f"compute_mtd_date_range: no {combine_type} session across "
@@ -611,20 +539,7 @@ def _mtd_find_month_start_session(
     while probe <= enddate:
         if is_target_session(probe):
             return probe
-        try:
-            probe += datetime.timedelta(days=1)
-        except OverflowError as e:
-            # Symmetric with _mtd_find_enddate's underflow guard. Only
-            # reachable in a degenerate clock-mocked scenario where
-            # enddate approaches date.max and is_target_session(enddate)
-            # returns False (e.g., calendar state flipped between
-            # enddate discovery and this search). Wrap so the caller
-            # sees a domain error, not a bare stdlib OverflowError.
-            raise RuntimeError(
-                f"compute_mtd_date_range: date overflow advancing probe "
-                f"in month-start search (probe reached {probe}, "
-                f"enddate={enddate})"
-            ) from e
+        probe += datetime.timedelta(days=1)
     raise RuntimeError(
         f"compute_mtd_date_range: no {combine_type} session in "
         f"[{month_first}, {enddate}] across {unique_venues}"
@@ -822,8 +737,8 @@ def lazy_parquet(
 
     # Resolve to absolute path so that scan_parquet paths remain valid
     # even if the caller changes the working directory before collect().
-    folder_path = os.path.realpath(folder_path)
-    folder = Path(folder_path)
+    folder = Path(folder_path).resolve()
+    folder_path = str(folder)
 
     if not folder.is_dir():
         raise FileNotFoundError(f"Folder does not exist: {folder_path}")
@@ -855,7 +770,10 @@ def lazy_parquet(
             if _listdir_attempt == 2:
                 raise
             time.sleep(0.5 * (2**_listdir_attempt))
-    assert file_names is not None  # loop exits via break or raise
+    if file_names is None:
+        # Loop exits via break or raise; this guard survives python -O
+        # where asserts are stripped.
+        raise RuntimeError("lazy_parquet: listdir retry loop exhausted unexpectedly")
 
     # Filter on extension only.  Do NOT gate with Path.is_file(): it
     # swallows OSError (including ENOENT) and returns False, which would
@@ -970,7 +888,7 @@ def lazy_parquet(
         )
 
     col_dtype = reference_schema[date_column]
-    base_dtype = getattr(col_dtype, "base_type", lambda: col_dtype)()
+    base_dtype = col_dtype.base_type()
     if base_dtype not in (pl.Date, pl.Datetime):
         raise TypeError(
             f"date_column '{date_column}' must be Date or Datetime, got {col_dtype}"
@@ -1813,10 +1731,6 @@ def save_matplotlib_charts_as_html(
     str
         Absolute path of the written HTML file.
     """
-    import base64
-    import html
-    import io
-
     # ── Step 1: Validate inputs ─────────────────────────────────────────
     if not isinstance(figures, list):
         raise TypeError(
@@ -2029,7 +1943,7 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
                 try:
                     Path(probe_path).unlink()
                 except OSError:
-                    pass
+                    pass  # Orphaned probe cleaned up by the stale-file sweep below
 
         # --- Sweep the folder for stale temp files and orphaned time probes ---
         for entry in folder.iterdir():
@@ -2157,23 +2071,23 @@ def _validate_inputs(
 def _resolve_folder_path(write_directory: str, subfolder: str) -> str:
     """Build the target folder path with traversal security check.
 
-    Resolves symlinks via os.path.realpath and then verifies that the
+    Resolves symlinks via Path.resolve() and then verifies that the
     resulting path is still inside write_directory.  This prevents a
     crafted subfolder like '../../etc' from escaping the intended root.
     """
-    base_dir = os.path.realpath(write_directory)
+    base_dir = str(Path(write_directory).resolve())
 
     # Normalize backslashes to forward slashes so that subfolder paths like
     # "data\output" are treated identically on both Windows (where \ is a
     # path separator) and Linux (where \ is a literal filename character).
-    # Then strip leading slashes so os.path.join treats it as relative,
-    # not as an absolute path that would silently override base_dir.
+    # Then strip leading slashes so the join treats it as relative, not as
+    # an absolute path that would silently override base_dir.
     subfolder_safe = subfolder.replace("\\", "/").lstrip("/")
     if not subfolder_safe:
         raise ValueError(
             f"subfolder resolves to empty after stripping leading slashes: {subfolder!r}"
         )
-    folder_path = os.path.realpath(str(Path(base_dir) / subfolder_safe))
+    folder_path = str((Path(base_dir) / subfolder_safe).resolve())
 
     # Traversal check: the resolved folder must be inside (or equal to) base_dir.
     # normcase ensures case-insensitive comparison on Windows (C:\Foo == c:\foo).
@@ -2213,19 +2127,9 @@ def _build_filename(
 
         col_dtype = dataframe.schema[sort_by_date_column]
 
-        # base_type() strips parameterization: Datetime("us") → Datetime, so the
-        # comparison works for all time-unit variants.  The fallback handles
-        # older Polars versions where base_type may not exist: if col_dtype is
-        # already a class (e.g. pl.Date), use it directly; if it's an instance
-        # (e.g. Datetime("us")), type() recovers the unparameterized class.
-        if hasattr(col_dtype, "base_type"):
-            base_dtype = col_dtype.base_type()
-        else:
-            # Older polars without base_type: col_dtype may be a class (pl.Date)
-            # or an instance (Datetime("us")).  Both branches resolve to
-            # type[pl.DataType] at runtime, but mypy can't unify the ternary
-            # against the base_type() branch above — hence the targeted ignore.
-            base_dtype = col_dtype if isinstance(col_dtype, type) else type(col_dtype)  # type: ignore[assignment]
+        # base_type() strips parameterization: Datetime("us") → Datetime, so
+        # the comparison works for all time-unit variants.
+        base_dtype = col_dtype.base_type()
         if base_dtype not in (pl.Date, pl.Datetime):
             raise TypeError(
                 f"Column '{sort_by_date_column}' expected Date or Datetime, got {col_dtype}"
@@ -2394,13 +2298,6 @@ def _makedirs_with_retry(folder_path: str) -> None:
     final attempt lets the OSError propagate so the caller sees the real
     failure.
     """
-    if not isinstance(folder_path, str):
-        raise TypeError(
-            f"folder_path must be a string, got {type(folder_path).__name__}"
-        )
-    if not folder_path.strip():
-        raise ValueError("folder_path must not be empty or whitespace")
-
     for _mkdir_attempt in range(12):
         try:
             Path(folder_path).mkdir(parents=True, exist_ok=True)
@@ -2468,7 +2365,7 @@ def _fsync_and_verify_size(tmp_path: str) -> int:
                     if not (attrs & stat.S_IWRITE):
                         tmp_p.chmod(attrs | stat.S_IWRITE)
                 except OSError:
-                    pass
+                    pass  # Best-effort chmod; next retry will surface the real error
             if win_err not in (5, 32, 33) and posix_err not in (
                 errno.EACCES,
                 errno.EBUSY,
@@ -2480,14 +2377,14 @@ def _fsync_and_verify_size(tmp_path: str) -> int:
                 try:
                     Path(tmp_path).unlink()
                 except OSError:
-                    pass
+                    pass  # Best-effort cleanup; tmp may already be gone
                 raise
             if _fsync_attempt == 11:
                 # Exhausted all retries — clean up partial tmp and propagate.
                 try:
                     Path(tmp_path).unlink()
                 except OSError:
-                    pass
+                    pass  # Best-effort cleanup; tmp may already be gone
                 raise
             time.sleep(min(15.0, 0.5 * (2**_fsync_attempt)))  # Backoff: 0.5s … 15s cap
 
@@ -2495,7 +2392,7 @@ def _fsync_and_verify_size(tmp_path: str) -> int:
         try:
             Path(tmp_path).unlink()
         except OSError:
-            pass
+            pass  # Best-effort cleanup; tmp may already be gone
         raise OSError(
             f"fsync produced a zero-byte or unmeasured file: {tmp_path}"
         )
@@ -2528,11 +2425,6 @@ def _write_and_fsync(dataframe: pl.DataFrame, tmp_path: str) -> int:
 
     Raises
     ------
-    TypeError
-        * dataframe is not a polars.DataFrame (e.g. LazyFrame, pandas, dict)
-        * tmp_path is not a string
-    ValueError
-        * tmp_path is empty or whitespace
     RuntimeError
         * write_parquet raises any non-OSError exception (polars
           ComputeError / SchemaError / PanicException, OOM, etc.).  The
@@ -2544,29 +2436,6 @@ def _write_and_fsync(dataframe: pl.DataFrame, tmp_path: str) -> int:
         * the final file is zero-byte or unmeasurable
         In all cases the partial tmp file is removed before propagating.
     """
-    # ── Input validation at the API boundary ────────────────────────────
-    # The only caller today is save_results(), which validates upstream.
-    # Validating here makes the function safe for any future direct caller
-    # and turns a cryptic AttributeError (LazyFrame has no write_parquet in
-    # older polars versions, or it means something different in newer ones)
-    # into an actionable TypeError.
-    if not isinstance(dataframe, pl.DataFrame):
-        hint = (
-            " Call .collect() first if you have a LazyFrame."
-            if isinstance(dataframe, pl.LazyFrame)
-            else ""
-        )
-        raise TypeError(
-            f"dataframe must be polars.DataFrame, "
-            f"got {type(dataframe).__name__}.{hint}"
-        )
-    if not isinstance(tmp_path, str):
-        raise TypeError(
-            f"tmp_path must be a string, got {type(tmp_path).__name__}"
-        )
-    if not tmp_path.strip():
-        raise ValueError("tmp_path must not be empty or whitespace")
-
     # Retry write_parquet for transient NAS I/O errors (network drops, SMB
     # sharing violations, NFS stale handles).  Before each retry, remove the
     # corrupted partial .tmp file — parquet format is not appendable, so
@@ -2595,7 +2464,7 @@ def _write_and_fsync(dataframe: pl.DataFrame, tmp_path: str) -> int:
             try:
                 Path(tmp_path).unlink()
             except OSError:
-                pass
+                pass  # Best-effort cleanup; tmp may not exist yet
             raise RuntimeError(
                 f"_write_and_fsync: polars write_parquet failed "
                 f"(tmp_path={tmp_path!r}, n_rows={dataframe.height}, "
@@ -2629,28 +2498,11 @@ def _write_bytes_and_fsync(data: bytes | bytearray | memoryview, tmp_path: str) 
 
     Raises
     ------
-    TypeError
-        * data is not bytes / bytearray / memoryview
-        * tmp_path is not a string
-    ValueError
-        * tmp_path is empty or whitespace
     OSError
         * write phase fails 4× consecutively
         * fsync phase fails (delegated to _fsync_and_verify_size)
         * final file size != len(data)
     """
-    if not isinstance(data, (bytes, bytearray, memoryview)):
-        raise TypeError(
-            f"data must be bytes-like (bytes, bytearray, memoryview), "
-            f"got {type(data).__name__}"
-        )
-    if not isinstance(tmp_path, str):
-        raise TypeError(
-            f"tmp_path must be a string, got {type(tmp_path).__name__}"
-        )
-    if not tmp_path.strip():
-        raise ValueError("tmp_path must not be empty or whitespace")
-
     expected_size = len(data)
 
     # Write phase: retry up to 4× for transient OSErrors.
@@ -2684,7 +2536,7 @@ def _write_bytes_and_fsync(data: bytes | bytearray | memoryview, tmp_path: str) 
             try:
                 Path(tmp_path).unlink()
             except OSError:
-                pass
+                pass  # Best-effort cleanup; tmp may not exist yet
             if _write_attempt == 3:
                 raise  # Exhausted write retries
             time.sleep(min(15.0, 1.0 * (2**_write_attempt)))  # Backoff: 1s, 2s, 4s
@@ -2698,7 +2550,7 @@ def _write_bytes_and_fsync(data: bytes | bytearray | memoryview, tmp_path: str) 
         try:
             Path(tmp_path).unlink()
         except OSError:
-            pass
+            pass  # Best-effort cleanup; tmp may already be gone
         raise OSError(
             f"Post-write size mismatch: expected {expected_size} bytes, "
             f"got {tmp_size} bytes for {tmp_path}"
@@ -2717,34 +2569,7 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
 
     Clears the read-only attribute on the target file if Access Denied
     (WinError 5 / EACCES) suggests it was set by backup/compliance tools.
-
-    Raises
-    ------
-    TypeError
-        * tmp_path or file_path is not a string
-    ValueError
-        * tmp_path or file_path is empty/whitespace
-        * tmp_path and file_path are identical (almost always a caller bug;
-          os.replace is a no-op on POSIX and fails on Windows)
     """
-    # ── Input validation at the API boundary ────────────────────────────
-    if not isinstance(tmp_path, str):
-        raise TypeError(
-            f"tmp_path must be a string, got {type(tmp_path).__name__}"
-        )
-    if not isinstance(file_path, str):
-        raise TypeError(
-            f"file_path must be a string, got {type(file_path).__name__}"
-        )
-    if not tmp_path.strip():
-        raise ValueError("tmp_path must not be empty or whitespace")
-    if not file_path.strip():
-        raise ValueError("file_path must not be empty or whitespace")
-    if tmp_path == file_path:
-        raise ValueError(
-            f"tmp_path and file_path must be distinct; both are {tmp_path!r}"
-        )
-
     file_p = Path(file_path)
     for _attempt in range(12):
         try:
@@ -2773,7 +2598,7 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
                     if not (attrs & stat.S_IWRITE):
                         file_p.chmod(attrs | stat.S_IWRITE)
                 except OSError:
-                    pass
+                    pass  # Best-effort chmod; next retry will surface the real error
             time.sleep(min(15.0, 0.5 * (2**_attempt)))  # Backoff: 0.5s … 15s cap
 
 

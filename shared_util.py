@@ -42,7 +42,7 @@ from matplotlib.figure import Figure
 def parse_arguments(
     default_startdate: datetime.date,
     default_enddate: datetime.date,
-    default_write_mode: str,
+    default_write_mode: Literal["dev", "prod"],
     dev_folder: str,
     prod_folder: str,
 ) -> tuple[datetime.date, datetime.date, str]:

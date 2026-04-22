@@ -31,6 +31,18 @@ import polars as pl
 from filelock import FileLock
 from matplotlib.figure import Figure
 
+__all__ = [
+    "parse_arguments",
+    "compute_mtd_date_range",
+    "lazy_parquet",
+    "winsorized_rolling_stats",
+    "plot_time_series",
+    "save_matplotlib_charts_as_html",
+    "save_results",
+    "sql_query",
+    "SqlIngestError",
+]
+
 #################################################################################################
 # Parse command line arguments (or use defaults in interactive mode), validate all inputs,
 # and resolve the write directory path. Returns (startdate, enddate, write_directory).
@@ -54,11 +66,33 @@ def parse_arguments(
 ) -> tuple[datetime.date, datetime.date, str]:
 
     # ── Step 1: Detect execution mode ────────────────────────────────────
-    # Detect Jupyter/IPython ('ipykernel') or standard REPL (sys.ps1).
-    # Avoid checking sys.argv[0].endswith(".py") as it incorrectly categorizes
-    # execution via `python -m`, PyInstaller (.exe), or script wrappers (.exe/.sh)
-    # as interactive, which would silently swallow CLI arguments.
-    is_interactive = hasattr(sys, "ps1") or "ipykernel" in sys.modules
+    # Detect a live interactive shell — NOT mere presence of ipykernel in
+    # ``sys.modules``.  A CLI script that imports a library which eagerly
+    # imports ``ipykernel`` (plotting shims, IPython-aware loggers) would
+    # otherwise be mis-classified as interactive and silently drop its
+    # ``-s``/``-e``/``-w`` CLI arguments.
+    #
+    # Two authoritative signals:
+    #   1. ``sys.ps1``  → standard Python REPL or IPython terminal (both
+    #      set the prompt-string attribute on import).
+    #   2. ``get_ipython()`` returning an instance whose class name starts
+    #      with ``ZMQ`` (``ZMQInteractiveShell``) → Jupyter / notebook /
+    #      lab kernel.  A plain-script call with IPython merely installed
+    #      returns ``None`` and stays non-interactive.
+    #
+    # We do NOT check ``sys.argv[0].endswith(".py")``: ``python -m``,
+    # PyInstaller (.exe), and script wrappers (.exe/.sh) would all be
+    # mis-categorized as interactive and silently swallow CLI arguments.
+    is_interactive = hasattr(sys, "ps1")
+    try:
+        from IPython.core.getipython import get_ipython  # type: ignore[import-not-found]
+
+        _ipython_shell = get_ipython()
+        if _ipython_shell is not None and "ZMQ" in type(_ipython_shell).__name__:
+            is_interactive = True
+    except ImportError:
+        # IPython is optional; absence just means we rely on ``sys.ps1``.
+        pass
 
     # ── Step 2: Obtain raw string inputs ─────────────────────────────────
     if is_interactive:
@@ -98,8 +132,22 @@ def parse_arguments(
             help=f"\nDestination to write the results. Default is {default_write_mode}. Options are dev or prod",
         )
 
-        # argparse converts --start-date -> start_date, --end-date -> end_date, --write-to -> write_to
-        args = parser.parse_args()
+        # Use parse_known_args to gracefully ignore unmapped flags injected
+        # by orchestrators (Airflow / Pytest / wrappers) instead of
+        # triggering ``sys.exit(2)``.  But unknown args MUST surface in logs:
+        # a typo like ``--start-dat 20240101`` would otherwise silently fall
+        # through to the default date with no indication that the caller's
+        # intent was dropped.  One WARNING line per call keeps the noise
+        # bounded while making real typos visible in log aggregation.
+        args, unknown_args = parser.parse_known_args()
+        if unknown_args:
+            logging.getLogger(__name__).warning(
+                "parse_arguments: ignoring %d unknown CLI argument(s): %r. "
+                "If an intended flag appears in this list, check for a typo "
+                "(e.g. '--start-dat' vs '--start-date'); otherwise these "
+                "are orchestrator-injected and can be ignored.",
+                len(unknown_args), unknown_args,
+            )
         start_date_str = args.start_date
         end_date_str = args.end_date
         write_to = args.write_to
@@ -341,16 +389,37 @@ def _mtd_make_session_probe(
     exceptions let a lookback-exhaustion error distinguish "library
     fault" from "genuine long closure" without spamming logs on every
     OOB probe. ``all`` for intersect, ``any`` for union.
+
+    Every calendar is probed on every call — we do NOT let ``all``/``any``
+    short-circuit the generator. A short-circuited probe would skip
+    calendars whose ``is_session`` would have raised (e.g. ``any`` stops
+    on the first ``True``; ``all`` stops on the first ``False``), so a
+    chronic library fault on one venue would never surface in
+    ``probe_errors``. The fail-closed posture on any error is preserved
+    so the lookback loop keeps walking past a problematic date rather
+    than silently accepting it.
     """
     probe_errors: list[BaseException] = []
     combine_fn = all if combine_type == "intersect" else any
 
     def _is_target_session(d: datetime.date) -> bool:
-        try:
-            return combine_fn(c.is_session(d) for c in cals)
-        except Exception as e:
-            probe_errors.append(e)
+        results: list[bool] = []
+        had_error = False
+        for c in cals:
+            try:
+                results.append(bool(c.is_session(d)))
+            except Exception as e:
+                probe_errors.append(e)
+                had_error = True
+                # Append False so len(results) stays aligned with cals;
+                # combine_fn output is overridden by had_error below.
+                results.append(False)
+        if had_error:
+            # Preserve the original "any error → not a session" contract;
+            # the lookback loop steps past and the exception is still
+            # visible to the exhaustion-error hint via probe_errors.
             return False
+        return combine_fn(results)
 
     return _is_target_session, probe_errors
 
@@ -388,10 +457,50 @@ def _mtd_should_include_today(
         return False
     try:
         if combine_type == "intersect":
-            closes = [c.session_close(today) for c in cals]
-            if any(cl is None for cl in closes):
+            # Per-venue try/except mirrors the union branch below so every
+            # venue's session_close error is captured (a list-comprehension
+            # would short-circuit on the first exception and silently drop
+            # subsequent venues' errors — making a multi-venue library
+            # regression look like a single-venue blip).
+            #
+            # Invariant: is_target_session(today)==True under intersect
+            # means every venue reports today as a session, so every venue
+            # MUST yield a concrete (non-None, non-raising) close. Any
+            # deviation (exception, None) is a library-inconsistency
+            # signal; we conservatively exclude today and surface the
+            # diagnostic via _mtd_safe_log_warning — same posture as the
+            # union branch's "zero concrete closes" log.
+            intersect_closes: list[Any] = []
+            intersect_close_errors: list[BaseException] = []
+            intersect_has_none = False
+            for c in cals:
+                try:
+                    cl = c.session_close(today)
+                except Exception as e:
+                    intersect_close_errors.append(e)
+                    continue
+                if cl is None:
+                    intersect_has_none = True
+                    continue
+                intersect_closes.append(cl)
+            if intersect_close_errors or intersect_has_none:
+                _mtd_safe_log_warning(
+                    "compute_mtd_date_range: intersect today-inclusion "
+                    "found is_target_session(today)=True but not every "
+                    "venue yielded a concrete close (venues=%s, today=%s, "
+                    "close_errors=%d, none_closes=%s, last_error=%s)",
+                    unique_venues, today, len(intersect_close_errors),
+                    intersect_has_none,
+                    (f"{type(intersect_close_errors[-1]).__name__}: "
+                     f"{intersect_close_errors[-1]!s}"
+                     if intersect_close_errors else "no-exception"),
+                )
                 return False
-            latest_close = max(closes)
+            # intersect_closes is non-empty here: cals is non-empty by
+            # construction (_mtd_load_calendars_and_tz guards) and every
+            # venue yielded a concrete close (the error/None guard above
+            # would have early-returned otherwise), so max() is safe.
+            latest_close = max(intersect_closes)
             # bool(numpy.bool_) → Python bool (fine).
             # bool(pd.NaT) → TypeError → caught below.
             # Plain datetime comparison → Python bool.
@@ -708,9 +817,39 @@ def lazy_parquet(
     date_column: str,
     start_date: datetime.date,
     end_date: datetime.date,
+    *,
+    require_tz_aware_timestamps: bool = False,
 ) -> pl.LazyFrame:
     """Lazy-scan every parquet file in ``folder_path``, validate schemas,
     and return a single date-filtered ``LazyFrame``.
+
+    ``date_column`` dtype handling
+    ------------------------------
+    Three cases are accepted; all three filter correctly *given a
+    consistent reference frame between the stored values and the
+    ``start_date`` / ``end_date`` bounds*:
+
+      * ``pl.Date`` — the cast is a no-op. Filter is pure date arithmetic
+        with no tz concept; always unambiguous.
+      * ``pl.Datetime`` tz-aware — the stored tz defines the calendar-day
+        boundary. ``.cast(pl.Date)`` extracts the date in that tz.
+      * ``pl.Datetime`` tz-naive — the wall-time date is used as-is. This
+        filters correctly **iff the upstream writer and the caller's
+        bounds agree on a single reference frame**. The **house
+        convention for naive data in this codebase is America/New_York
+        wall time**; if a pipeline stores naive timestamps in any other
+        frame, document it at the call site. This function cannot detect
+        a frame mismatch between stored values and bounds.
+
+    The cross-file schema consistency check already rejects mixed
+    tz-aware/tz-naive or multi-tz cases, so a single surprising file
+    cannot silently contaminate the result — the only residual risk is
+    a whole-dataset frame mismatch with the caller's bounds, which is a
+    data-team contract issue no dtype-inspection can catch.
+
+    Set ``require_tz_aware_timestamps=True`` to reject tz-naive Datetime
+    columns at the inbound boundary; pure ``pl.Date`` always passes
+    (no tz concept). Mirrors the same-named parameter in ``sql_query``.
 
     Notes
     -----
@@ -737,6 +876,13 @@ def lazy_parquet(
         raise ValueError("folder_path must not be empty or whitespace")
     if not date_column or not date_column.strip():
         raise ValueError("date_column must not be empty or whitespace")
+    # Guard against truthy-string / int-1 sneaking in through kwargs; matches
+    # the bool-validation pattern used in sql_query's boundary checks.
+    if not isinstance(require_tz_aware_timestamps, bool):
+        raise TypeError(
+            f"require_tz_aware_timestamps must be a bool, got "
+            f"{type(require_tz_aware_timestamps).__name__}"
+        )
 
     # Resolve to absolute path so that scan_parquet paths remain valid
     # even if the caller changes the working directory before collect().
@@ -754,6 +900,14 @@ def lazy_parquet(
         start_date = start_date.date()
     if isinstance(end_date, datetime.datetime):
         end_date = end_date.date()
+        
+    # Fail fast if the caller passed string values (e.g. "2024-01-01") bypassing type hints.
+    # Passing strings to pl.lit() creates a String literal that will cause a delayed, opaque
+    # ComputeError when the downstream pipeline evaluates the LazyFrame via .collect().
+    if not isinstance(start_date, datetime.date):
+        raise TypeError(f"start_date must be a datetime.date object, got {type(start_date).__name__}")
+    if not isinstance(end_date, datetime.date):
+        raise TypeError(f"end_date must be a datetime.date object, got {type(end_date).__name__}")
 
     if start_date > end_date:
         raise ValueError(
@@ -830,7 +984,59 @@ def lazy_parquet(
                 time.sleep(min(15.0, 0.5 * (2**_attempt)))
         raise AssertionError("unreachable")  # loop exits via return or raise
 
-    file_paths = [str(folder / file) for file in parquet_file_names]
+    def _scan_with_retry(path: str) -> pl.LazyFrame:
+        """Build the lazy scan.  Raises on any failure after retries.
+
+        Same rationale as _read_schema_with_retry: ENOENT is not skipped
+        because the date-range-filename pattern means a vanished file
+        implies an unseen replacement.  Fail loud and let the caller retry.
+        """
+        for _attempt in range(12):
+            try:
+                return pl.scan_parquet(path)
+            except OSError as e:
+                if not _is_transient_lock(e):
+                    raise
+                if _attempt == 11:
+                    raise
+                time.sleep(min(15.0, 0.5 * (2**_attempt)))
+        raise AssertionError("unreachable")
+
+    def _null_count_with_retry(path: str, col: str) -> int:
+        """Return null count of ``col`` in ``path``, retried on transient NAS locks.
+
+        Uses parquet column statistics when present (Polars' own
+        ``write_parquet`` embeds them by default), so this is near-zero I/O
+        for files we produce.  Third-party writers without stats fall back
+        to a full column scan — still bounded to one column and cheaper
+        than a full-frame materialize.
+
+        Non-OSError failures (ComputeError from a corrupt file, PanicException
+        from a version regression) propagate: a corrupt file is an inbound-
+        boundary violation and must halt the load, mirroring the fail-loud
+        posture of _read_schema_with_retry.
+        """
+        for _attempt in range(12):
+            try:
+                return int(
+                    pl.scan_parquet(path)
+                    .select(pl.col(col).null_count().alias("__lp_nullcount"))
+                    .collect()
+                    .item()
+                )
+            except OSError as e:
+                if not _is_transient_lock(e):
+                    raise
+                if _attempt == 11:
+                    raise
+                time.sleep(min(15.0, 0.5 * (2**_attempt)))
+        raise AssertionError("unreachable")
+
+    # Sort alphabetically to guarantee chronological chunk ordering.
+    # Since files are named via zero-padded ranges (e.g. prefix-202001-202012.parquet), 
+    # alphabetical sorting ensures pl.concat stitches the time series monotonically.
+    file_paths = sorted([str(folder / file) for file in parquet_file_names])
+    
     schemas: dict[str, dict[str, pl.DataType]] = {}
     for path in file_paths:
         # Fail loud on corruption as well as I/O.  Orchestrators (Airflow,
@@ -897,35 +1103,74 @@ def lazy_parquet(
             f"date_column '{date_column}' must be Date or Datetime, got {col_dtype}"
         )
 
+    # Opt-in tz-awareness guard (CLAUDE.md inbound contract).  Pure
+    # ``pl.Date`` is always unambiguous so it passes regardless; only
+    # tz-naive ``pl.Datetime`` is rejected when the caller opts in via
+    # ``require_tz_aware_timestamps=True``.  House convention for naive
+    # data is America/New_York wall time (see the docstring) — callers
+    # who need to attach it explicitly should do so upstream via
+    # ``pl.col(...).dt.replace_time_zone("America/New_York")``.
+    # ``_datetime_tz`` (defined later in this module, resolved at call
+    # time) abstracts over polars' pre-/post-0.18 attribute rename
+    # (``tz`` → ``time_zone``) so older installs don't AttributeError.
+    if require_tz_aware_timestamps and isinstance(col_dtype, pl.Datetime):
+        if _datetime_tz(col_dtype) is None:
+            raise TypeError(
+                f"lazy_parquet: date_column {date_column!r} is tz-naive "
+                f"Datetime ({col_dtype}) but require_tz_aware_timestamps=True. "
+                f"Attach a tz upstream (pl.col(...).dt.replace_time_zone("
+                f"'America/New_York') for the house convention), convert to "
+                f"pl.Date if the time component is irrelevant, or drop "
+                f"require_tz_aware_timestamps to accept the naive column "
+                f"under the house-convention contract."
+            )
+
+    # Inbound boundary: reject nulls in date_column across every file.
+    # The date-range filter below evaluates ``null >= x`` as null, which
+    # ``filter()`` silently drops — producing an undetectable shrink of
+    # the dataset when upstream delivers null-dated rows (e.g. data-team
+    # contract drift).  Fail loud instead: point-in-time correctness
+    # depends on every row having a known date, and silent row loss is
+    # the most expensive failure mode in this pipeline.
+    #
+    # Cost is near zero for Polars-written files (parquet column
+    # statistics carry null counts at the row-group level and polars'
+    # projection pushdown answers from stats alone); falls back to a
+    # projected column scan for third-party writers without stats.
+    null_counts_by_file: dict[str, int] = {}
+    for path in file_paths:
+        _n = _null_count_with_retry(path, date_column)
+        if _n > 0:
+            null_counts_by_file[Path(path).name] = _n
+    if null_counts_by_file:
+        _total_nulls = sum(null_counts_by_file.values())
+        _sample = dict(list(null_counts_by_file.items())[:5])
+        _more = (
+            ""
+            if len(null_counts_by_file) <= 5
+            else f" (+{len(null_counts_by_file) - 5} more file(s))"
+        )
+        raise ValueError(
+            f"lazy_parquet: date_column {date_column!r} contains "
+            f"{_total_nulls} null value(s) across {len(null_counts_by_file)} "
+            f"file(s); null-dated rows would be silently dropped by the "
+            f"date-range filter. Reject at the inbound boundary instead — "
+            f"pre-filter nulls at the call site or fix upstream. "
+            f"Sample: {_sample}{_more}"
+        )
+
     # Build lazy scans with per-file error handling.
     # Files can vanish between schema-read and scan on a shared NAS
     # (e.g. concurrent save_results replacing old date-range files).
     # scan_parquet is lazy and won't fail on a missing file, but it can
     # fail eagerly in some Polars versions or on permission errors.
+    # ``_scan_with_retry`` is defined above alongside the other I/O helpers.
     #
     # Select columns in reference order on each frame. pl.concat with
     # how="vertical" (the default for LazyFrames) matches columns by
     # *position*, not by name. If two parquet files store the same columns
     # in a different order, positional concat silently produces wrong data
     # or raises a dtype-mismatch error at collect-time.
-    def _scan_with_retry(path: str) -> pl.LazyFrame:
-        """Build the lazy scan.  Raises on any failure after retries.
-
-        Same rationale as _read_schema_with_retry: ENOENT is not skipped
-        because the date-range-filename pattern means a vanished file
-        implies an unseen replacement.  Fail loud and let the caller retry.
-        """
-        for _attempt in range(12):
-            try:
-                return pl.scan_parquet(path)
-            except OSError as e:
-                if not _is_transient_lock(e):
-                    raise
-                if _attempt == 11:
-                    raise
-                time.sleep(min(15.0, 0.5 * (2**_attempt)))
-        raise AssertionError("unreachable")
-
     reference_columns = list(reference_schema.keys())
     dataframes = []
     for path in file_paths:
@@ -1821,6 +2066,14 @@ def save_matplotlib_charts_as_html(
     # ── Step 4: Create folder with NAS-resilient retry ──────────────────
     _makedirs_with_retry(folder_path)
 
+    # Sweep orphaned .tmp files from prior crashed runs (same 24h threshold
+    # and server-time probe as save_results).  Without this, a crashed
+    # invocation leaves a <prefix>_charts.html.<uuid>.tmp on the NAS
+    # forever — over months on a shared folder these accumulate without
+    # bound.  Cleanup is best-effort; any failure is silently suppressed
+    # inside the helper.
+    _cleanup_stale_files(folder_path, max_age_seconds=86400, prefix=file_name_prefix)
+
     # ── Step 5: Render figures to base64 PNGs ───────────────────────────
     safe_prefix = html.escape(file_name_prefix)
     html_parts: list[str] = [
@@ -1834,6 +2087,11 @@ def save_matplotlib_charts_as_html(
         f"<p style='color:#666;font-size:0.9em;'>Generated: "
         f"{datetime.datetime.now(tz=_REPORT_TZ).strftime('%Y-%m-%d %H:%M:%S')} {_REPORT_TZ_LABEL}</p>",
     ]
+
+    # Track cumulative encoded-image bytes so the size-cap failure names
+    # the offending figure (incremental check) rather than silently letting
+    # the loop balloon memory and failing only at end-of-loop total.
+    cumulative_b64_bytes: int = 0
 
     for i, fig in enumerate(figures):
         axes_list = fig.get_axes()
@@ -1859,6 +2117,25 @@ def save_matplotlib_charts_as_html(
             b64 = base64.b64encode(buf.read()).decode("ascii")
         finally:
             buf.close()
+
+        # Enforce the aggregate HTML-size cap incrementally.  Fail-fast
+        # with the offending figure's index + title so the caller can
+        # act (lower dpi, drop a figure, split into multiple reports)
+        # instead of discovering an unrenderable gigabyte HTML on disk.
+        cumulative_b64_bytes += len(b64)
+        if cumulative_b64_bytes > _MAX_CHARTS_HTML_BYTES:
+            raise ValueError(
+                f"save_matplotlib_charts_as_html: aggregate encoded image "
+                f"size reached {cumulative_b64_bytes / (1024 * 1024):.1f} "
+                f"MiB after figures[{i}] (title={raw_title!r}), exceeding "
+                f"the "
+                f"{_MAX_CHARTS_HTML_BYTES // (1024 * 1024)} MiB cap — "
+                f"most browsers refuse to render HTML of this size. "
+                f"Remedies: lower matplotlib dpi (this function uses 100), "
+                f"split the figures across multiple calls, or raise "
+                f"_MAX_CHARTS_HTML_BYTES in shared_util.py if the larger "
+                f"single artifact is genuinely needed."
+            )
 
         if safe_title:
             html_parts.append(f"<h2>{safe_title}</h2>")
@@ -1937,8 +2214,21 @@ except zoneinfo.ZoneInfoNotFoundError:
     _REPORT_TZ_LABEL = "UTC (install 'tzdata' for US Eastern on Windows)"
 
 
+## Aggregate base64-encoded image-byte cap for save_matplotlib_charts_as_html.
+## Gigabyte-scale HTML (easily reached by 50 × 30-panel figures at dpi=100)
+## is typically unusable — most browsers refuse to render it or hang trying.
+## 100 MiB is generous for normal reporting; operators who genuinely need a
+## larger single artifact can raise this constant at the module boundary.
+_MAX_CHARTS_HTML_BYTES: int = 100 * 1024 * 1024  # 100 MiB
+
+
 def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) -> None:
     """Remove orphaned .tmp and .time_probe_ files older than max_age_seconds.
+
+    Recognizes the two tmp-file patterns this module produces:
+      * ``save_results``                  → ``<prefix>.parquet.<uuid8>.tmp``
+                                         or ``<prefix>-YYYYMM-YYYYMM.parquet.<uuid8>.tmp``
+      * ``save_matplotlib_charts_as_html`` → ``<prefix>_charts.html.<uuid8>.tmp``
 
     Uses a probe file to determine the NAS server's current time, avoiding
     false deletions caused by clock drift between the client and the Isilon node.
@@ -2011,6 +2301,15 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
                     # files belonging to prefix="sales-123-456" (3-digit blocks).
                     if re.match(r"^[+-]?\d{6,}-[+-]?\d{6,}$", date_part):
                         is_stale_tmp = True
+            # HTML-report tmp pattern: <prefix>_charts.html.<uuid8>.tmp.
+            # rsplit on the rightmost ".html." so a prefix containing
+            # ".html." (unusual but legal under the filename validator)
+            # still isolates correctly. Match base_name against the exact
+            # file_name that save_matplotlib_charts_as_html produces.
+            if not is_stale_tmp and f.endswith(".tmp") and ".html." in f:
+                base_name = f.rsplit(".html.", 1)[0]
+                if base_name == f"{prefix}_charts":
+                    is_stale_tmp = True
             is_orphaned_probe = f.startswith(".time_probe_")
             if not (is_stale_tmp or is_orphaned_probe):
                 continue
@@ -2637,24 +2936,52 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
 def _verify_written_size(file_path: str, expected_size: int) -> None:
     """Verify that the written file matches the expected size.
 
-    Uses os.fstat(fd) on an open handle to bypass the SMB directory metadata
-    cache, which can return the OLD file's size for up to
-    FileInfoCacheLifetime seconds (default 10s, often tuned to 30-60s on
-    enterprise Isilon clusters).  os.fstat on an open handle queries the
-    NAS directly (IRP on Windows, GETATTR RPC on NFS), guaranteeing fresh
-    metadata regardless of local cache TTL.
+    Uses ``os.fstat(fd)`` on an open handle to bypass the SMB directory
+    metadata cache, which can return the OLD file's size for up to
+    ``FileInfoCacheLifetime`` seconds (default 10s, often tuned to 30–60s
+    on enterprise Isilon clusters).  ``os.fstat`` on an open handle
+    queries the NAS directly (IRP on Windows, GETATTR RPC on NFS),
+    guaranteeing fresh metadata regardless of local cache TTL.
 
-    Retries up to 12× with 1-second intervals for transient AV/DLP locks on
-    os.open.  If a positive size is read that differs from expected, stops
-    retrying immediately — fstat on an open handle is authoritative, so a
-    mismatch is a genuine different file (concurrent overwrite), not stale
-    metadata.
+    Retries up to 12× with 0.5s → 15s exponential backoff on transient
+    AV/DLP/SMB locks (WinError 5/32/33, EACCES/EBUSY/EAGAIN/ESTALE/
+    ETXTBSY) — matches the envelope used by ``_fsync_and_verify_size``
+    and ``_atomic_replace`` so long AV holds don't false-fail the
+    post-commit verification.  Non-transient errnos fail fast.  Once a
+    positive size has been read, retrying stops immediately: ``fstat``
+    on an open handle is authoritative, so a mismatch is a genuine
+    different file on disk, not stale metadata.
 
-    Raises OSError only if the file cannot be opened or read at all (size
-    stays ≤ 0).  A positive size mismatch is downgraded to a printed notice
-    because the atomic commit (os.replace) already succeeded — crashing here
-    would cause false-negative failures in the orchestrator.
+    Outcome contract:
+
+      * ``written_size == expected_size`` → return (OK).
+      * ``written_size > expected_size`` → downgrade to a printed
+        notice and return.  A larger on-disk size is a legitimate
+        concurrent-overwrite outcome: any successful writer passed its
+        own ``_write_and_fsync`` size check before ``os.replace``, so
+        the on-disk bytes form a full validated parquet (e.g. from a
+        different compression pass).  Crashing here would cause the
+        orchestrator to retry indefinitely against an already-committed
+        transaction.
+      * ``0 <= written_size < expected_size`` → raise.  This cannot
+        arise from a validly-committed concurrent writer
+        (``_write_and_fsync`` verifies tmp size before the atomic
+        rename), so a strictly smaller final file implies external
+        truncation (AV quarantine mid-scan, NAS write-behind bug, or
+        out-of-band rewrite by a non-pipeline process).  Accepting it
+        silently would ship a partial artifact downstream.
+
+    Raises
+    ------
+    OSError
+        * Non-transient ``os.open`` / ``os.fstat`` error on any attempt.
+        * 12 consecutive transient lock errors (retries exhausted).
+        * Final size is strictly smaller than ``expected_size``.
     """
+    # Seed with -1 so a post-loop branch can distinguish "never measured"
+    # from "measured small".  Under normal flow the loop either returns,
+    # breaks with written_size > 0, or raises — so -1 survival should be
+    # unreachable.  Kept for defense against future refactors.
     written_size = -1
     for _verify_attempt in range(12):
         try:
@@ -2666,31 +2993,84 @@ def _verify_written_size(file_path: str, expected_size: int) -> None:
             if written_size == expected_size:
                 return
             # fstat on an open handle is authoritative (bypasses SMB cache).
-            # A positive mismatch means a concurrent worker overwrote the file
-            # (Polars parquet is not byte-deterministic across threads).  No
-            # amount of retrying will change the size — break immediately.
+            # A positive mismatch means a concurrent worker overwrote the
+            # file (Polars parquet is not byte-deterministic across
+            # threads).  No amount of retrying will change the size —
+            # break immediately and let the post-loop branch decide
+            # larger-than-expected (accept) vs smaller (raise).
             if written_size > 0:
                 break
-        except OSError:
-            pass  # File may briefly be locked by AV scanners; retry
-        time.sleep(1.0)
+            # written_size == 0: extremely unusual for a file we just
+            # atomically committed via os.replace of a size-verified tmp.
+            # Could indicate a NAS write-behind cache lie or a racing
+            # truncate by an external tool.  Treat like a transient and
+            # retry; if it persists to the end of the loop, the post-loop
+            # branch will raise (0 < expected_size).
+        except OSError as e:
+            win_err = getattr(e, "winerror", 0)
+            posix_err = getattr(e, "errno", 0)
+            if win_err not in (5, 32, 33) and posix_err not in (
+                errno.EACCES,
+                errno.EBUSY,
+                errno.EAGAIN,
+                _ESTALE,
+                _ETXTBSY,
+            ):
+                raise  # Non-transient — surface the real error immediately
+            if _verify_attempt == 11:
+                raise  # Exhausted retries on a sustained transient lock
+        time.sleep(min(15.0, 0.5 * (2**_verify_attempt)))  # 0.5s … 15s cap
 
-    # If the file is readable with a positive size but different from expected,
-    # the atomic commit succeeded and a concurrent worker safely overwrote it.
-    # Downgrade to a notice: crashing would cause the orchestrator to retry
-    # indefinitely against an already-committed transaction.
-    if written_size > 0 and written_size != expected_size:
+    # ── Post-loop classification ─────────────────────────────────────
+    # A strictly larger file is the only silent-acceptance case: it can
+    # only come from a concurrent writer whose own _write_and_fsync
+    # validated its tmp size before os.replace, so the on-disk bytes are
+    # a complete, validated parquet from some writer.  Log and return.
+    if written_size > expected_size:
         print(
-            f"Notice: Written size ({written_size}) differs from expected "
-            f"({expected_size}) for {file_path}. This is expected if a "
-            f"concurrent task safely overwrote the same partition."
+            f"Notice: Written size ({written_size}) exceeds expected "
+            f"({expected_size}) for {file_path}. This is consistent with a "
+            f"concurrent task safely overwriting the same partition with a "
+            f"different (larger) compression pass."
         )
         return
 
+    # Remaining cases: written_size in {-1, 0, ..., expected_size - 1}.
+    # None of these can arise from a validly-committed write path:
+    #   * -1  → os.open never succeeded within the retry window (unreachable
+    #           under normal flow; the transient-lock retry would have
+    #           raised already).
+    #   *  0  → the file is empty on disk despite a size-verified commit.
+    #   * >0 and < expected_size → file is strictly smaller than what we
+    #           committed; _write_and_fsync validates tmp size before
+    #           os.replace, so no successful writer could have produced
+    #           this.  Indicates external truncation (AV quarantine mid-
+    #           scan, NAS write-behind bug, or out-of-band rewrite).
+    # All three warrant a hard raise to prevent a partial artifact from
+    # reaching downstream consumers.
+    _hint = (
+        "size could not be measured (every os.open attempt failed but the "
+        "retry loop exited without raising — check for a refactor that "
+        "weakened the retry-exhaustion guard)"
+        if written_size < 0
+        else (
+            "file is empty on disk despite a size-verified commit — likely "
+            "a NAS write-behind cache inconsistency or an out-of-band "
+            "truncate"
+            if written_size == 0
+            else (
+                "file is strictly smaller than what we committed. Cannot "
+                "arise from a validly-committed concurrent writer "
+                "(_write_and_fsync verifies tmp size before os.replace), so "
+                "this indicates external truncation (AV quarantine mid-"
+                "scan, NAS write-behind bug, or out-of-band rewrite). "
+                "Rejecting to avoid shipping a partial artifact downstream"
+            )
+        )
+    )
     raise OSError(
         f"Post-write verification failed: expected {expected_size} bytes, "
-        f"got {written_size} bytes for {file_path}. "
-        f"File was renamed successfully but size could not be confirmed."
+        f"got {written_size} bytes for {file_path}; {_hint}."
     )
 
 
@@ -2729,6 +3109,40 @@ def save_results(
 
     Returns:
         The absolute path of the written parquet file.
+
+    Concurrency / idempotency contract (READ BEFORE PARALLELIZING)
+    --------------------------------------------------------------
+    The final filename is a pure function of ``(file_name_prefix,
+    sort_by_date_column range)``.  Two workers called with the same
+    tuple will race for the same target path; ``os.replace`` accepts
+    whichever commits last, and the earlier commit is overwritten
+    with NO warning.  ``_verify_written_size`` catches a strictly
+    smaller post-replace file (which can only come from external
+    truncation), but two logically-different writes of the same
+    nominal shape will each pass their own size check — the "loser"
+    still reports success and the "winner's" bytes ship downstream.
+
+    Consequence: this function is idempotent ONLY when concurrent
+    workers for the same (prefix, range) produce logically equivalent
+    parquet content.  ``write_parquet`` is not byte-deterministic
+    across threads/versions, so even identical inputs can yield
+    different bytes; that is benign.  What is NOT benign is two
+    workers with DIFFERENT upstream inputs (e.g. one read a stale
+    snapshot).  There is no guard here against that case.
+
+    If stronger guarantees are needed, distinguish the writers at
+    the call site:
+      * vary ``file_name_prefix`` per worker (include a run-id or
+        input-hash suffix),
+      * vary the ``subfolder`` per worker, or
+      * coordinate at the orchestrator level so only one worker
+        owns a given (prefix, range) window.
+
+    The cross-process ``FileLock`` guards only the atomic rename +
+    duplicate cleanup; it does NOT serialize distinct workers writing
+    the same prefix, because ``_write_and_fsync`` runs outside the
+    lock by design (so independent date-range partitions can stream
+    in parallel).
     """
     # ── Steps 1-2: Validate inputs and resolve target folder ─────────────
     _validate_inputs(dataframe, write_directory, subfolder, file_name_prefix)
@@ -2858,8 +3272,6 @@ def save_results(
 
 #################################################################################################
 # Function for reading SQL data
-
-__all__ = ["sql_query", "SqlIngestError"]
 
 class SqlIngestError(RuntimeError):
     """Boundary-contract failure while ingesting from SQL Server."""
@@ -3063,11 +3475,48 @@ def _normalize_server(server: str) -> tuple[str, bool]:
         if not s.strip():
             raise SqlIngestError("server is empty after stripping 'tcp:' prefix")
         low = s.lower()
+
+    if "," in s:
+        raise SqlIngestError(
+            f"server string {server!r} contains a comma. Use the 'port' parameter "
+            "to specify the port number instead."
+        )
+
     # Windows-only protocol prefixes — keep the prefix, no tcp:/port.
+    # Require a non-empty host segment after the prefix so bare ``"np:"``
+    # / ``"lpc:"`` / ``"admin:"`` fail at our boundary with a clear
+    # message instead of bubbling an opaque ``"Data source name not
+    # found"`` / ``"server not found"`` up from the ODBC layer far from
+    # the call site.
     for pfx in ("np:", "lpc:", "admin:"):
         if low.startswith(pfx):
+            if not s[len(pfx):].strip():
+                raise SqlIngestError(
+                    f"server {server!r} has the {pfx!r} protocol prefix "
+                    f"but no host segment follows it; expected "
+                    f"{pfx!r}<host>"
+                )
             return s, True
-    return s, ("\\" in s)
+
+    # Named-instance syntax: HOST\INSTANCE. Require non-empty segments
+    # on both sides of a single backslash and reject multi-backslash
+    # strings — neither form is a valid named instance and both would
+    # otherwise reach ODBC as an opaque error.
+    if "\\" in s:
+        instance_parts = s.split("\\")
+        if (
+            len(instance_parts) != 2
+            or not instance_parts[0].strip()
+            or not instance_parts[1].strip()
+        ):
+            raise SqlIngestError(
+                f"server {server!r} uses named-instance syntax "
+                f"(HOST\\INSTANCE) but host or instance segment is empty, "
+                f"or the value contains multiple backslashes"
+            )
+        return s, True
+
+    return s, False
 
 
 def _validate_parameters(
@@ -3075,6 +3524,18 @@ def _validate_parameters(
 ) -> list[str | None] | None:
     if parameters is None:
         return None
+    # Guard against bare str/bytes: both are Sequence[str]-compatible and
+    # would silently iterate character-by-character (``"SPY"`` → ``['S','P','Y']``),
+    # so the per-element ``isinstance(p, str)`` check below would pass and
+    # arrow_odbc would receive single-character bindings. Fail fast at the
+    # boundary with a descriptive domain exception. Matches the pattern in
+    # ``_mtd_validate_inputs``.
+    if isinstance(parameters, (str, bytes)):
+        raise SqlIngestError(
+            f"parameters must be a sequence of str/None (e.g. list/tuple), "
+            f"not a bare {type(parameters).__name__}: {parameters!r}. "
+            "Wrap single values in a list: parameters=[value]."
+        )
     params = list(parameters)
     for i, p in enumerate(params):
         if p is not None and not isinstance(p, str):
@@ -3092,6 +3553,17 @@ def _validate_expected_columns(
 ) -> list[str] | None:
     if expected_columns is None:
         return None
+    # Guard against bare str/bytes: both are Sequence[str]-compatible and
+    # would silently iterate character-by-character (``"Date"`` →
+    # ``['D','a','t','e']``), so the per-element ``isinstance(c, str)`` check
+    # below would pass and the downstream schema comparison would emit a
+    # confusing ``missing=['D','a','t','e']`` error. Fail fast here instead.
+    if isinstance(expected_columns, (str, bytes)):
+        raise SqlIngestError(
+            f"expected_columns must be a sequence of str (e.g. list/tuple), "
+            f"not a bare {type(expected_columns).__name__}: {expected_columns!r}. "
+            "Wrap a single column name in a list: expected_columns=[name]."
+        )
     out = list(expected_columns)
     for i, c in enumerate(out):
         if not isinstance(c, str) or not c:
@@ -3275,6 +3747,13 @@ def sql_query(
     _check_conn_token("database", database)
     _check_conn_token("driver", driver)
 
+    # Normalize known driver strings to fix unixODBC case-sensitivity on Linux
+    _known_drivers = {
+        "odbc driver 17 for sql server": "ODBC Driver 17 for SQL Server",
+        "odbc driver 18 for sql server": "ODBC Driver 18 for SQL Server",
+    }
+    driver_canon = _known_drivers.get(driver.lower(), driver)
+
     if not isinstance(query, str) or not query.strip():
         raise SqlIngestError("query must be a non-empty, non-whitespace str")
     if "\x00" in query:
@@ -3382,10 +3861,17 @@ def sql_query(
         server_segment = f"SERVER={server_canon}"
     else:
         server_segment = f"SERVER=tcp:{server_canon},{port}"
+    # Brace-quote DATABASE for symmetry with DRIVER so values containing
+    # "=" or other ODBC-reserved punctuation can never be mis-parsed by
+    # downstream tools (some driver managers, proxies, and monitoring
+    # probes tokenize loosely).  `_check_conn_token` already rejects `{`,
+    # `}`, `;`, NUL, CR, LF in `database`, so brace-quoting is closed-form
+    # safe — the value can never contain the closing `}` that would break
+    # the quoting.
     parts = [
-        f"DRIVER={{{driver}}}",
+        f"DRIVER={{{driver_canon}}}",
         server_segment,
-        f"DATABASE={database}",
+        f"DATABASE={{{database}}}",
     ]
     if use_trusted:
         parts.append("Trusted_Connection=yes")

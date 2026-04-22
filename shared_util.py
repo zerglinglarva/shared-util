@@ -1,5 +1,11 @@
 #################################################################################################
 # Import Libraries
+from __future__ import annotations
+from collections.abc import Sequence
+import polars as pl
+import pyarrow as pa  # type: ignore[import-untyped]
+from arrow_odbc import read_arrow_batches_from_odbc  # type: ignore[import-untyped]
+
 import argparse
 import base64
 import datetime
@@ -16,7 +22,7 @@ import uuid
 import zoneinfo
 from collections.abc import Callable
 from pathlib import Path, PurePath
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, overload
 
 import exchange_calendars as xcals  # type: ignore[import-untyped]
 import matplotlib.pyplot as plt
@@ -2849,3 +2855,734 @@ def save_results(
     elapsed = (time.monotonic() - start_time) / 60
     print(f"Results saved to: {file_path}, Time taken (minutes): {elapsed:.2f}")
     return file_path
+
+#################################################################################################
+# Function for reading SQL data
+
+__all__ = ["sql_query", "SqlIngestError"]
+
+class SqlIngestError(RuntimeError):
+    """Boundary-contract failure while ingesting from SQL Server."""
+
+# Characters that would let an attacker (or a malformed config value) escape
+# a DRIVER={...} / SERVER=... / DATABASE=... segment and inject arbitrary
+# ODBC connection-string keys.
+_CONN_STR_FORBIDDEN = (";", "{", "}", "\x00", "\n", "\r")
+
+# Generous but finite upper bounds to catch typos without over-constraining.
+_MAX_BATCH_SIZE = 10_000_000
+_MAX_TIMEOUT_SEC = 86_400  # 1 day; beyond this the caller almost certainly meant "no timeout"
+_MAX_ROWS_CAP = 10**12  # trillion-row hard ceiling on the caller-supplied max_rows
+_MAX_VALUE_BYTES = 2**31 - 1  # 2 GiB; SQL Server's per-value MAX-type upper bound
+
+# Whitelist of `Authentication=...` values accepted by the Microsoft SQL
+# ODBC driver. A whitelist (not free-form str) is required because this
+# value is interpolated into the connection string; allowing arbitrary
+# text would reopen the conn-string injection surface we lock down with
+# _CONN_STR_FORBIDDEN.
+_AUTH_REQUIRES_CREDS = frozenset(
+    {
+        "ActiveDirectoryPassword",
+        "ActiveDirectoryServicePrincipal",
+        "SqlPassword",
+    }
+)
+_AUTH_NO_CREDS = frozenset(
+    {
+        "ActiveDirectoryIntegrated",
+        "ActiveDirectoryMsi",
+        "ActiveDirectoryDefault",
+        "ActiveDirectoryInteractive",
+    }
+)
+_AUTHENTICATION_VALUES = _AUTH_REQUIRES_CREDS | _AUTH_NO_CREDS
+
+
+def _check_conn_token(name: str, value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SqlIngestError(
+            f"{name} must be a non-empty, non-whitespace str, got "
+            f"{type(value).__name__}={value!r}"
+        )
+    # Leading/trailing whitespace is silently tolerated by some ODBC driver
+    # managers and rejected by others; rather than silently strip (which
+    # would hide caller-side typos like copy-pasting from docs), reject at
+    # the boundary with an actionable message.
+    if value != value.strip():
+        raise SqlIngestError(
+            f"{name} has leading/trailing whitespace: {value!r}. "
+            "Strip at the call site for consistent cross-platform behavior."
+        )
+    for ch in _CONN_STR_FORBIDDEN:
+        if ch in value:
+            raise SqlIngestError(
+                f"{name} contains forbidden character {ch!r}: {value!r}"
+            )
+    return value
+
+
+@overload
+def _check_int(
+    name: str,
+    value: int | None,
+    *,
+    minv: int,
+    maxv: int,
+    allow_none: Literal[False] = ...,
+) -> int: ...
+
+
+@overload
+def _check_int(
+    name: str,
+    value: int | None,
+    *,
+    minv: int,
+    maxv: int,
+    allow_none: Literal[True],
+) -> int | None: ...
+
+
+def _check_int(
+    name: str,
+    value: int | None,
+    *,
+    minv: int,
+    maxv: int,
+    allow_none: bool = False,
+) -> int | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise SqlIngestError(f"{name} must not be None")
+    # bool is an int subclass in Python; reject explicitly to prevent
+    # `port=True` silently meaning 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SqlIngestError(
+            f"{name} must be int, got {type(value).__name__}={value!r}"
+        )
+    if not (minv <= value <= maxv):
+        raise SqlIngestError(
+            f"{name} must be in [{minv}, {maxv}], got {value}"
+        )
+    return value
+
+
+def _check_bool(name: str, value: bool) -> None:
+    # Guard against truthy-string / int-1 sneaking in through kwargs.
+    if not isinstance(value, bool):
+        raise SqlIngestError(
+            f"{name} must be bool, got {type(value).__name__}={value!r}"
+        )
+
+
+def _check_optional_bool(name: str, value: bool | None) -> None:
+    if value is None:
+        return
+    _check_bool(name, value)
+
+
+def _check_optional_str(name: str, value: str | None) -> None:
+    if value is not None and not isinstance(value, str):
+        raise SqlIngestError(
+            f"{name} must be str or None, got {type(value).__name__}={value!r}"
+        )
+
+
+def _check_no_control_chars(name: str, value: str) -> None:
+    """Reject NUL / LF / CR inside a credential or similar token.
+
+    These are almost always artifacts of reading the value from stdin or
+    from a text file without stripping the trailing newline, and the
+    downstream ODBC error message differs by platform (Windows returns
+    SQLSTATE 28000 while unixODBC on Linux typically returns IM002), so
+    catch them at our boundary with an actionable message.
+    """
+    for bad in ("\x00", "\n", "\r"):
+        if bad in value:
+            raise SqlIngestError(
+                f"{name} contains a control character {bad!r}; commonly "
+                "seen when reading credentials from stdin or a file "
+                "without stripping a trailing newline"
+            )
+
+
+def _find_duplicates(names: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    dupes: list[str] = []
+    for n in names:
+        if n in seen and n not in dupes:
+            dupes.append(n)
+        seen.add(n)
+    return sorted(dupes)
+
+
+def _datetime_tz(dtype: pl.DataType) -> str | None:
+    """Return the timezone of a Polars Datetime dtype, or None if naive.
+
+    Polars renamed the attribute from ``tz`` to ``time_zone`` around 0.18;
+    check both so older installs don't crash with ``AttributeError`` when
+    the caller opts into ``require_tz_aware_timestamps``.
+    """
+    tz = getattr(dtype, "time_zone", None)
+    if tz is None:
+        tz = getattr(dtype, "tz", None)
+    return tz
+
+
+def _normalize_server(server: str) -> tuple[str, bool]:
+    """Return ``(server_value, emit_verbatim)``.
+
+    When ``emit_verbatim`` is True the caller must build
+    ``SERVER={server_value}`` with no ``tcp:`` prefix and no trailing
+    ``,port``. This covers three cases:
+
+      * SQL Server named instances (``HOST\\INSTANCE``), which resolve via
+        the SQL Browser service and must not carry an explicit port.
+      * Windows-only protocol prefixes — ``np:`` (named pipes), ``lpc:``
+        (shared memory / local procedure call), ``admin:`` (Dedicated
+        Admin Connection) — which specify a transport inline and must be
+        passed through unchanged. On non-Windows these paths fail at the
+        driver layer with a clear ODBC error, which is the intended
+        cross-platform behavior.
+
+    For the common ``tcp:HOST`` form we strip the redundant prefix so
+    the caller doesn't emit ``tcp:tcp:HOST``. Stripping happens BEFORE
+    the non-TCP prefix / named-instance detection so callers who
+    programmatically prepend ``tcp:`` to e.g. ``np:HOST`` or
+    ``HOST\\INSTANCE`` still route correctly.
+    """
+    s = server
+    low = s.lower()
+    # Strip redundant leading tcp: prefixes first — otherwise tcp:np:HOST,
+    # tcp:HOST\\INSTANCE, and the pathological tcp:tcp:HOST all bypass
+    # the verbatim-emit branches below. Loop (rather than strip once) so
+    # multi-layer programmatic prepends normalize cleanly.
+    while low.startswith("tcp:"):
+        s = s[4:]
+        if not s.strip():
+            raise SqlIngestError("server is empty after stripping 'tcp:' prefix")
+        low = s.lower()
+    # Windows-only protocol prefixes — keep the prefix, no tcp:/port.
+    for pfx in ("np:", "lpc:", "admin:"):
+        if low.startswith(pfx):
+            return s, True
+    return s, ("\\" in s)
+
+
+def _validate_parameters(
+    parameters: Sequence[str | None] | None,
+) -> list[str | None] | None:
+    if parameters is None:
+        return None
+    params = list(parameters)
+    for i, p in enumerate(params):
+        if p is not None and not isinstance(p, str):
+            raise SqlIngestError(
+                f"parameters[{i}] must be str or None, got "
+                f"{type(p).__name__}={p!r}. arrow_odbc binds ODBC "
+                "parameters as strings; convert numbers via str() at the "
+                "call site."
+            )
+    return params
+
+
+def _validate_expected_columns(
+    expected_columns: Sequence[str] | None,
+) -> list[str] | None:
+    if expected_columns is None:
+        return None
+    out = list(expected_columns)
+    for i, c in enumerate(out):
+        if not isinstance(c, str) or not c:
+            raise SqlIngestError(
+                f"expected_columns[{i}] must be non-empty str, got "
+                f"{type(c).__name__}={c!r}"
+            )
+    dupes = _find_duplicates(out)
+    if dupes:
+        raise SqlIngestError(f"expected_columns contains duplicates: {dupes}")
+    return out
+
+
+def sql_query(
+    server: str,
+    database: str,
+    query: str,
+    *,
+    parameters: Sequence[str | None] | None = None,
+    driver: str = "ODBC Driver 17 for SQL Server",
+    port: int = 1433,
+    user: str | None = None,
+    password: str | None = None,
+    batch_size: int = 100_000,
+    login_timeout_sec: int = 30,
+    query_timeout_sec: int | None = None,
+    max_rows: int | None = None,
+    max_text_size: int | None = None,
+    max_binary_size: int | None = None,
+    encrypt: bool | None = None,
+    trust_server_certificate: bool | None = None,
+    authentication: str | None = None,
+    expected_columns: Sequence[str] | None = None,
+    allow_extra_columns: bool = False,
+    require_non_empty: bool = False,
+    require_tz_aware_timestamps: bool = False,
+) -> pl.DataFrame:
+    """Run a SELECT against SQL Server and return a Polars DataFrame.
+
+    Parameters are bound via ODBC (``parameters``), never via string
+    formatting, so callers should always prefer ``?`` placeholders over
+    f-strings in ``query``. All failures surface as ``SqlIngestError``.
+
+    Memory: the full result set is materialized in memory. For multi-GB
+    queries, shrink the server-side projection or filter before calling,
+    or pass ``max_rows`` to abort early.
+
+    ``max_rows`` (opt-in): caps how many rows the stream is allowed to
+    accumulate before we abort with ``SqlIngestError``. The abort fires
+    during streaming, so at most one extra ``batch_size`` chunk of rows
+    is buffered beyond the cap before memory is released.
+
+    ``max_text_size`` / ``max_binary_size`` (opt-in, bytes): forwarded to
+    ``arrow_odbc`` to size the buffers it allocates for unbounded SQL
+    types (``VARCHAR(MAX)``, ``NVARCHAR(MAX)``, ``VARBINARY(MAX)``, etc.).
+    arrow_odbc's default behavior for these types is version-dependent
+    and has historically truncated to ~1 MB or ~4096 characters. If your
+    SELECT returns MAX-type columns, set these explicitly to the maximum
+    value size you expect; otherwise silent truncation is possible.
+
+    ``encrypt`` / ``trust_server_certificate`` (opt-in): emitted as
+    ``Encrypt=yes|no`` and ``TrustServerCertificate=yes|no`` in the ODBC
+    connection string. ``Encrypt`` is ALWAYS emitted explicitly — when
+    the caller passes ``encrypt=None`` we pin ``Encrypt=no`` so that
+    ``driver="ODBC Driver 17 for SQL Server"`` and
+    ``driver="ODBC Driver 18 for SQL Server"`` produce identical
+    connection semantics for an otherwise-unchanged call. (Driver 18
+    flipped the implicit default from ``no`` to ``yes``; without the
+    pin a bare driver-string swap would silently enable TLS + server
+    cert validation and typically fail against servers with
+    self-signed or internal-CA certificates.) Pass ``encrypt=True`` to
+    opt into TLS, and with either driver set
+    ``trust_server_certificate=True`` as well if the server presents a
+    self-signed or internal-CA certificate. ``trust_server_certificate
+    =None`` leaves the driver default in place (strict validation).
+
+    ``authentication`` (opt-in): emitted as ``Authentication=<value>``.
+    Accepted values (whitelist): ``SqlPassword``,
+    ``ActiveDirectoryPassword``, ``ActiveDirectoryServicePrincipal``
+    (require ``user``+``password``); ``ActiveDirectoryIntegrated``,
+    ``ActiveDirectoryMsi``, ``ActiveDirectoryDefault``,
+    ``ActiveDirectoryInteractive`` (must not pass ``user``/``password``).
+    Use this to authenticate against Azure SQL / SQL Server via Entra ID
+    from any platform. Values are case-sensitive (must match the
+    canonical PascalCase above).
+
+    Headless-auth caveats:
+      * ``ActiveDirectoryInteractive`` launches a browser for OAuth —
+        UNSUITABLE for servers, Docker containers, systemd services,
+        cron jobs, or CI on any platform. Use ``ActiveDirectoryPassword``
+        or ``ActiveDirectoryServicePrincipal`` for non-interactive
+        contexts.
+      * ``ActiveDirectoryIntegrated`` resolves against the platform's
+        native credential source — Windows SSPI (current logged-in user)
+        on Windows, Kerberos ticket cache (``KRB5CCNAME``) on Linux /
+        macOS. Same config string, different prerequisites.
+      * ``ActiveDirectoryMsi`` requires the process to run on an Azure
+        VM / App Service / container with a managed identity assigned;
+        fails outside Azure.
+
+    Cross-platform:
+      * Driver names ``"ODBC Driver 17 for SQL Server"`` and
+        ``"ODBC Driver 18 for SQL Server"`` are both supported and
+        produce identical connection semantics from this wrapper (see
+        the ``encrypt`` section above — ``Encrypt`` is always pinned
+        explicitly, so the Driver 18 default flip does not change
+        behavior here). The strings are identical on Windows and
+        Linux, but each driver must be installed separately: MSI on
+        Windows, ``msodbcsql17`` / ``msodbcsql18`` package on Linux
+        via Microsoft's apt/yum repo, Homebrew on macOS. Driver 18
+        also requires the target SQL Server to negotiate TLS 1.2+;
+        only relevant when ``encrypt=True`` (our default ``Encrypt=no``
+        short-circuits TLS altogether).
+      * Driver manager: Windows uses the built-in ODBC Driver Manager
+        (case-INSENSITIVE driver lookup); Linux/macOS must use
+        ``unixODBC`` (case-SENSITIVE driver lookup against
+        ``/etc/odbcinst.ini`` — the Microsoft package installs the
+        driver under the exact string above, so our default matches,
+        but a case-typo that works on Windows will fail on Linux with
+        "Data source name not found". Note that macOS defaults to
+        iODBC, which is NOT supported by ``msodbcsql``; install and
+        configure ``unixODBC`` on macOS.
+      * The DEFAULT auth mode is ``Trusted_Connection=yes`` (triggered
+        when ``user``, ``password``, and ``authentication`` are all
+        ``None``). This works natively via SSPI on Windows but requires
+        a valid Kerberos ticket (``kinit``) on Linux / macOS. Without a
+        ticket, Linux callers should supply explicit ``user``/
+        ``password`` (SQL auth) or use
+        ``authentication="ActiveDirectoryPassword"`` (Entra ID).
+      * Server-value protocol prefixes are preserved verbatim without
+        auto-adding ``tcp:`` or ``,port``:
+          - ``tcp:HOST`` — explicit TCP, works on both; we strip the
+            redundant prefix so you don't get ``tcp:tcp:HOST``.
+          - ``np:HOST``, ``lpc:HOST``, ``admin:HOST`` — Windows-only
+            (named pipes, shared memory, DAC). Passed through; on
+            Linux/macOS these will fail at the driver layer with a
+            clear ODBC error.
+      * Named-instance syntax (``HOST\\INSTANCE``) works on both
+        platforms (SQL Browser discovery over UDP 1434).
+      * ``login_timeout_sec=0`` is accepted for API symmetry but is
+        interpreted differently across driver versions and platforms —
+        some treat it as "fail immediately" and some as "use driver
+        default (~15 s)". Prefer an explicit positive value (e.g. 30)
+        for predictable behavior everywhere.
+
+    Multiple result sets: ``arrow_odbc`` materializes only the FIRST
+    result set produced by the statement; subsequent result sets from
+    stored procedures that ``SELECT`` more than once are silently
+    dropped. Split such procedures into per-result-set calls, or wrap
+    the logic in a single SELECT.
+
+    Named instances: if ``server`` contains ``\\`` (e.g. ``HOST\\SQLEXPRESS``)
+    the ``port`` argument is ignored and the instance is resolved via the
+    SQL Browser service.
+
+    Set ``require_tz_aware_timestamps=True`` to enforce the CLAUDE.md
+    inbound contract that every Datetime column carries a timezone
+    (rejects SQL Server ``datetime2`` / ``datetime`` columns unless your
+    query casts them to ``datetimeoffset``).
+
+    Output contract:
+      * Column order and names are preserved exactly as SQL Server returns
+        them. Case matches the server's projection; callers doing asof
+        joins or positional selects must match this ordering.
+      * The returned DataFrame is NOT sorted — caller must sort explicitly
+        before any asof join.
+      * Row count equals the number of rows the server streamed; this
+        function never silently drops, dedupes, or truncates.
+      * ``expected_columns`` is a NAMES-ONLY contract; dtypes are not
+        compared. Downstream callers that need dtype guarantees should
+        follow up with ``df.cast(...)`` or validate ``df.schema``
+        explicitly at the call site.
+
+    Thread-safety: each call opens its own ODBC cursor via arrow_odbc and
+    holds no module-level state, so concurrent calls from independent
+    threads are safe. Callers must not share a returned DataFrame across
+    threads without their own synchronization (standard Polars rules).
+    """
+    # --- input validation (inbound boundary) ---------------------------------
+    _check_conn_token("server", server)
+    _check_conn_token("database", database)
+    _check_conn_token("driver", driver)
+
+    if not isinstance(query, str) or not query.strip():
+        raise SqlIngestError("query must be a non-empty, non-whitespace str")
+    if "\x00" in query:
+        raise SqlIngestError("query contains a null byte")
+    if "\ufeff" in query:
+        # UTF-8 BOM (U+FEFF) leaks in from files saved as "UTF-8 with
+        # BOM" (common on Windows editors / older PowerShell Set-Content)
+        # and from naive concatenation of two such files. SQL Server
+        # sees the U+FEFF and fails with "incorrect syntax near ''".
+        # Using the "\ufeff" escape (rather than a literal invisible
+        # character in the source) keeps this check robust across
+        # editor re-encodings and source-file BOM handling. Reject
+        # anywhere in the query, not just at the start, since mid-string
+        # BOMs from file concatenation produce the same error.
+        raise SqlIngestError(
+            "query contains a UTF-8 BOM (U+FEFF); re-save the source "
+            "file as plain UTF-8, or strip via query.replace('\\ufeff', '')"
+        )
+
+    _check_int("port", port, minv=1, maxv=65_535)
+    _check_int("batch_size", batch_size, minv=1, maxv=_MAX_BATCH_SIZE)
+    _check_int(
+        "login_timeout_sec", login_timeout_sec, minv=0, maxv=_MAX_TIMEOUT_SEC
+    )
+    _check_int(
+        "query_timeout_sec",
+        query_timeout_sec,
+        minv=0,
+        maxv=_MAX_TIMEOUT_SEC,
+        allow_none=True,
+    )
+    max_rows_val = _check_int(
+        "max_rows", max_rows, minv=0, maxv=_MAX_ROWS_CAP, allow_none=True
+    )
+    _check_int(
+        "max_text_size",
+        max_text_size,
+        minv=1,
+        maxv=_MAX_VALUE_BYTES,
+        allow_none=True,
+    )
+    _check_int(
+        "max_binary_size",
+        max_binary_size,
+        minv=1,
+        maxv=_MAX_VALUE_BYTES,
+        allow_none=True,
+    )
+    _check_bool("require_non_empty", require_non_empty)
+    _check_bool("allow_extra_columns", allow_extra_columns)
+    _check_bool("require_tz_aware_timestamps", require_tz_aware_timestamps)
+    _check_optional_bool("encrypt", encrypt)
+    _check_optional_bool("trust_server_certificate", trust_server_certificate)
+
+    _check_optional_str("user", user)
+    _check_optional_str("password", password)
+    if (user is None) != (password is None):
+        raise SqlIngestError(
+            "user and password must be supplied together, or both omitted "
+            "for trusted (SSPI on Windows / Kerberos on Linux & macOS) or "
+            "credential-less (AAD) auth"
+        )
+    if user is not None:
+        if not user:
+            raise SqlIngestError("user must be non-empty when provided")
+        _check_no_control_chars("user", user)
+    if password is not None:
+        if not password:
+            # Empty password is almost always an unset-env-var typo; reject
+            # so the caller finds out at our boundary, not via a cryptic
+            # ODBC auth failure later.
+            raise SqlIngestError("password must be non-empty when provided")
+        _check_no_control_chars("password", password)
+
+    _check_optional_str("authentication", authentication)
+    if authentication is not None:
+        if authentication not in _AUTHENTICATION_VALUES:
+            raise SqlIngestError(
+                f"authentication={authentication!r} not in whitelist; "
+                f"allowed: {sorted(_AUTHENTICATION_VALUES)}"
+            )
+        if authentication in _AUTH_REQUIRES_CREDS and user is None:
+            raise SqlIngestError(
+                f"authentication={authentication!r} requires user and password"
+            )
+        if authentication in _AUTH_NO_CREDS and user is not None:
+            raise SqlIngestError(
+                f"authentication={authentication!r} must not be combined "
+                "with user/password"
+            )
+
+    params = _validate_parameters(parameters)
+    expected = _validate_expected_columns(expected_columns)
+    server_canon, emit_server_verbatim = _normalize_server(server)
+
+    # --- build connection string ---------------------------------------------
+    # Trusted auth only kicks in when the caller supplied neither SQL creds
+    # nor an explicit `authentication` mode. On Linux this path requires a
+    # Kerberos ticket (see the Cross-platform note in the docstring).
+    use_trusted = user is None and authentication is None
+    if emit_server_verbatim:
+        # Named instance (HOST\\INSTANCE) or Windows-only protocol prefix
+        # (np:/lpc:/admin:). Both forms must not carry an auto-added
+        # `tcp:` or `,PORT`.
+        server_segment = f"SERVER={server_canon}"
+    else:
+        server_segment = f"SERVER=tcp:{server_canon},{port}"
+    parts = [
+        f"DRIVER={{{driver}}}",
+        server_segment,
+        f"DATABASE={database}",
+    ]
+    if use_trusted:
+        parts.append("Trusted_Connection=yes")
+    if authentication is not None:
+        # Value is whitelist-constrained above, so safe to interpolate.
+        parts.append(f"Authentication={authentication}")
+    # Pin Encrypt explicitly, independent of driver version. ODBC Driver
+    # 18 flipped the implicit default from `no` (Driver 17) to `yes`, so
+    # an unspecified `encrypt` would silently change TLS semantics across
+    # a bare driver-string swap. Defaulting to `no` here preserves Driver
+    # 17's legacy behavior so callers who only change the driver string
+    # continue to connect against the same server with the same semantics.
+    effective_encrypt = encrypt if encrypt is not None else False
+    parts.append(f"Encrypt={'yes' if effective_encrypt else 'no'}")
+    if trust_server_certificate is not None:
+        parts.append(
+            f"TrustServerCertificate={'yes' if trust_server_certificate else 'no'}"
+        )
+    conn_str = ";".join(parts) + ";"
+
+    # --- open reader ---------------------------------------------------------
+    try:
+        reader = read_arrow_batches_from_odbc(
+            connection_string=conn_str,
+            query=query,
+            batch_size=batch_size,
+            user=user,
+            password=password,
+            parameters=params,
+            login_timeout_sec=login_timeout_sec,
+            query_timeout_sec=query_timeout_sec,
+            max_text_size=max_text_size,
+            max_binary_size=max_binary_size,
+        )
+    except TypeError as exc:
+        # arrow_odbc added `max_text_size` / `max_binary_size` /
+        # `query_timeout_sec` in different releases; an "unexpected
+        # keyword argument" here almost certainly means the installed
+        # arrow_odbc is older than this wrapper expects.
+        raise SqlIngestError(
+            f"arrow_odbc rejected a keyword argument "
+            f"(likely a version mismatch): {exc}"
+        ) from exc
+    except Exception as exc:  # arrow_odbc raises a variety of native errors
+        raise SqlIngestError(
+            f"failed to open ODBC reader against {server_canon}/{database}: {exc}"
+        ) from exc
+
+    if reader is None:
+        # arrow_odbc returns None for statements with no result set
+        # (INSERT/UPDATE/DDL). sql_query is defined only for SELECT.
+        raise SqlIngestError(
+            "query produced no result set; sql_query expects a SELECT"
+        )
+
+    # All reader usage (schema read, batch streaming) is wrapped so that the
+    # ODBC cursor is released synchronously in every exit path — normal
+    # return, caller-facing raise, or unexpected raise. In CPython this
+    # triggers arrow_odbc's Rust Drop immediately, so the server-side cursor
+    # is closed before the SqlIngestError propagates up the stack.
+    batches: list[pa.RecordBatch] = []
+    total_rows = 0
+    over_cap = False
+    try:
+        try:
+            schema = reader.schema
+        except Exception as exc:
+            raise SqlIngestError(
+                f"failed to read arrow schema from ODBC result: {exc}"
+            ) from exc
+        if schema is None:
+            raise SqlIngestError("ODBC result reported a null arrow schema")
+
+        # Pre-conversion: reject duplicate arrow field names with a clear
+        # error rather than letting pl.from_arrow raise an opaque
+        # ComputeError.
+        schema_names: list[str] = list(schema.names)
+        schema_dupes = _find_duplicates(schema_names)
+        if schema_dupes:
+            raise SqlIngestError(
+                f"duplicate column names in server result set: {schema_dupes}"
+            )
+
+        # Manual iteration (vs list(reader)) so max_rows can abort early
+        # before we balloon memory on a runaway result.
+        try:
+            for batch in reader:
+                batches.append(batch)
+                total_rows += batch.num_rows
+                if max_rows_val is not None and total_rows > max_rows_val:
+                    over_cap = True
+                    break
+        except Exception as exc:
+            batches.clear()
+            raise SqlIngestError(
+                f"failed while streaming batches from {server_canon}/{database}: {exc}"
+            ) from exc
+
+        if over_cap:
+            # `over_cap = True` is only set inside the streaming loop after
+            # the `max_rows_val is not None` guard, so this assert narrows
+            # the type for readers and type-checkers without being a
+            # load-bearing check.
+            assert max_rows_val is not None
+            batches.clear()
+            raise SqlIngestError(
+                f"result exceeded max_rows={max_rows_val}: streamed "
+                f"{total_rows} rows before abort against "
+                f"{server_canon}/{database}"
+            )
+    finally:
+        del reader
+
+    try:
+        table = pa.Table.from_batches(batches=batches, schema=schema)
+    except Exception as exc:
+        # Release the accumulated batches before propagating; the Table
+        # wasn't built, so they'd otherwise linger until GC.
+        batches.clear()
+        raise SqlIngestError(f"failed to assemble arrow table: {exc}") from exc
+
+    if table.num_rows != total_rows:
+        raise SqlIngestError(
+            "row-count invariant violated assembling arrow Table: "
+            f"sum(batch.num_rows)={total_rows} vs table.num_rows="
+            f"{table.num_rows}"
+        )
+
+    # Release per-batch Python refs. The Table keeps its own zero-copy
+    # references to the underlying buffers.
+    batches.clear()
+
+    # pl.from_arrow(Table) returns DataFrame; the Series branch exists for
+    # Array/ChunkedArray inputs. Wrap defensively: recent Polars rejects
+    # tables with duplicate arrow field names, which we'd rather surface
+    # as SqlIngestError than as a raw pl.exceptions error.
+    try:
+        df_or_series = pl.from_arrow(table)
+    except Exception as exc:
+        raise SqlIngestError(
+            f"failed to convert arrow Table to Polars DataFrame: {exc}"
+        ) from exc
+    if not isinstance(df_or_series, pl.DataFrame):
+        raise SqlIngestError(
+            f"expected pl.DataFrame from arrow Table, got "
+            f"{type(df_or_series).__name__}"
+        )
+    df = df_or_series
+
+    # --- schema & row-count preservation across arrow -> polars --------------
+    cols = list(df.columns)
+    if cols != schema_names:
+        raise SqlIngestError(
+            "schema mismatch between arrow Table and Polars DataFrame "
+            f"(arrow={schema_names} polars={cols}); "
+            "pl.from_arrow must not reorder or rename columns"
+        )
+    if df.height != total_rows:
+        raise SqlIngestError(
+            "row-count invariant violated in arrow->polars conversion: "
+            f"expected {total_rows}, got {df.height}"
+        )
+
+    # --- post-load caller-facing checks --------------------------------------
+    cols_dupes = _find_duplicates(cols)
+    if cols_dupes:
+        # Unreachable given the pre-conversion schema check, but kept as a
+        # defense-in-depth guard against future arrow/polars behavior drift.
+        raise SqlIngestError(
+            f"duplicate column names in result set: {cols_dupes}"
+        )
+
+    if expected is not None:
+        missing = [c for c in expected if c not in cols]
+        extra = [c for c in cols if c not in expected]
+        if missing or (extra and not allow_extra_columns):
+            err_msg = f"schema mismatch: missing={missing}"
+            if not allow_extra_columns:
+                err_msg += f" extra={extra}"
+            err_msg += f" got={cols}"
+            raise SqlIngestError(err_msg)
+
+    if require_tz_aware_timestamps:
+        naive: list[str] = []
+        for name, dtype in df.schema.items():
+            if isinstance(dtype, pl.Datetime) and _datetime_tz(dtype) is None:
+                naive.append(name)
+        if naive:
+            raise SqlIngestError(
+                "require_tz_aware_timestamps=True but columns lack tz: "
+                f"{naive}"
+            )
+
+    if require_non_empty and df.height == 0:
+        raise SqlIngestError(
+            f"query returned 0 rows against {server_canon}/{database} "
+            "(require_non_empty=True)"
+        )
+
+    return df

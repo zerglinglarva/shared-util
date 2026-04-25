@@ -19,7 +19,7 @@ import uuid
 import zoneinfo
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path, PurePath
-from typing import Any, Literal, NamedTuple, overload, Protocol, cast
+from typing import Any, Literal, NamedTuple, Protocol, cast, overload
 
 import exchange_calendars as xcals  # type: ignore[import-untyped]
 import matplotlib.pyplot as plt
@@ -235,9 +235,18 @@ def parse_arguments(
     # mis-categorized as interactive and silently swallow CLI arguments.
     is_interactive = hasattr(sys, "ps1")
     try:
-        from IPython.core.getipython import get_ipython  # type: ignore[import-not-found]
+        # ``unused-ignore`` lets the same source compile in environments
+        # where IPython is installed (mypy stubs resolve, no
+        # ``import-not-found``) AND in environments where it isn't
+        # (the ignore actually suppresses ``import-not-found``). The
+        # ``no-untyped-call`` ignore is for ``get_ipython()`` itself —
+        # IPython ships no type stubs, so even when import succeeds
+        # mypy sees the call as untyped.
+        from IPython.core.getipython import (  # type: ignore[import-not-found, unused-ignore]
+            get_ipython,
+        )
 
-        _ipython_shell = get_ipython()
+        _ipython_shell = get_ipython()  # type: ignore[no-untyped-call]
         if _ipython_shell is not None and "ZMQ" in type(_ipython_shell).__name__:
             is_interactive = True
     except Exception:  # noqa: BLE001 — interactive-mode detection is best-effort
@@ -381,15 +390,21 @@ def parse_arguments(
     if not prod_folder or not prod_folder.strip():
         raise ValueError("prod_folder must not be empty or whitespace")
 
-    # Normalize to lowercase so CLI input like 'DEV', 'Prod' is accepted
-    write_to = write_to.strip().lower()
-    if write_to == "dev":
+    # Normalize to lowercase so CLI input like 'DEV', 'Prod' is accepted.
+    # ``write_to`` here is bound to either the ``Literal['dev', 'prod']``
+    # default OR the raw ``argparse`` string; rebinding it to ``.lower()``
+    # output would widen the local type back to ``str`` and trip mypy
+    # under ``--strict``. Use a fresh variable so the Literal narrowing
+    # on ``write_to`` is preserved if anything below ever needs it.
+    write_to_norm = write_to.strip().lower()
+    if write_to_norm == "dev":
         write_directory = dev_folder
-    elif write_to == "prod":
+    elif write_to_norm == "prod":
         write_directory = prod_folder
     else:
         raise ValueError(
-            f"Invalid value for write_to: '{write_to}'. Options are 'dev' or 'prod'"
+            f"Invalid value for write_to: '{write_to_norm}'. "
+            f"Options are 'dev' or 'prod'"
         )
 
     # Resolve to absolute path so the returned directory remains valid even if
@@ -405,14 +420,17 @@ def parse_arguments(
     # Same hard-reject discipline as write_to: hard-fail on anything outside
     # {'hot', 'cold'} so a typo like 'warm' or 'HOT2' surfaces immediately
     # instead of being silently passed to the caller's downstream resolver.
-    input_mode = input_mode.strip().lower()
-    if input_mode not in ("hot", "cold"):
+    # Fresh variable name (vs rebinding ``input_mode``) preserves the
+    # ``Literal['hot', 'cold']`` narrowing on the parameter under
+    # ``mypy --strict`` — see the ``write_to_norm`` comment above.
+    input_mode_norm = input_mode.strip().lower()
+    if input_mode_norm not in ("hot", "cold"):
         raise ValueError(
-            f"Invalid value for input_mode: '{input_mode}'. "
+            f"Invalid value for input_mode: '{input_mode_norm}'. "
             f"Options are 'hot' or 'cold'"
         )
 
-    return startdate, enddate, write_directory, input_mode
+    return startdate, enddate, write_directory, input_mode_norm
 
 #################################################################################################
 # Compute default month-to-date date range from the composite exchange calendar of the given venues.
@@ -1160,7 +1178,7 @@ def lazy_parquet(
         start_date = start_date.date()
     if isinstance(end_date, datetime.datetime):
         end_date = end_date.date()
-        
+
     # Fail fast if the caller passed string values (e.g. "2024-01-01") bypassing type hints.
     # Passing strings to pl.lit() creates a String literal that will cause a delayed, opaque
     # ComputeError when the downstream pipeline evaluates the LazyFrame via .collect().
@@ -1293,10 +1311,10 @@ def lazy_parquet(
         raise AssertionError("unreachable")
 
     # Sort alphabetically to guarantee chronological chunk ordering.
-    # Since files are named via zero-padded ranges (e.g. prefix-202001-202012.parquet), 
+    # Since files are named via zero-padded ranges (e.g. prefix-202001-202012.parquet),
     # alphabetical sorting ensures pl.concat stitches the time series monotonically.
     file_paths = sorted([str(folder / file) for file in parquet_file_names])
-    
+
     schemas: dict[str, dict[str, pl.DataType]] = {}
     for path in file_paths:
         # Fail loud on corruption as well as I/O.  Orchestrators (Airflow,
@@ -3797,8 +3815,8 @@ def save_results(
         # non-ASCII prefixes (Turkish dotted-I, German "ß"), making the
         # "saved" vs "updated" message label unreliable across hosts.
         try:
-            for _entry in os.listdir(folder_path):
-                if dup_pattern.match(_entry.casefold()):
+            for _entry in Path(folder_path).iterdir():
+                if dup_pattern.match(_entry.name.casefold()):
                     pre_existed_predecessor = True
                     break
         except OSError:

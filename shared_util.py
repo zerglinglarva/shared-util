@@ -1,10 +1,6 @@
 #################################################################################################
 # Import Libraries
 from __future__ import annotations
-from collections.abc import Sequence
-import polars as pl
-import pyarrow as pa  # type: ignore[import-untyped]
-from arrow_odbc import read_arrow_batches_from_odbc  # type: ignore[import-untyped]
 
 import argparse
 import base64
@@ -20,14 +16,16 @@ import sys
 import time
 import uuid
 import zoneinfo
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path, PurePath
-from typing import Any, Literal, NamedTuple, overload
+from typing import Any, Literal, NamedTuple, overload, Protocol, cast
 
 import exchange_calendars as xcals  # type: ignore[import-untyped]
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import polars as pl
+import pyarrow as pa  # type: ignore[import-untyped]
+from arrow_odbc import read_arrow_batches_from_odbc  # type: ignore[import-untyped]
 from filelock import FileLock
 from matplotlib.figure import Figure
 
@@ -41,7 +39,94 @@ __all__ = [
     "save_results",
     "sql_query",
     "SqlIngestError",
+    "redshift_query",
+    "RedshiftIngestError",
 ]
+
+
+#################################################################################################
+# Module-level utilities used across multiple sections.
+
+def _datetime_tz(dtype: pl.DataType) -> str | None:
+    """Return the timezone of a Polars Datetime dtype, or None if naive.
+
+    Polars renamed the attribute from ``tz`` to ``time_zone`` around 0.18;
+    check both so older installs don't crash with ``AttributeError`` when
+    a caller opts into ``require_tz_aware_timestamps``. Collapse ``""`` to
+    ``None`` because a handful of polars minor versions report the absence
+    of a zone as an empty string rather than ``None``, which would
+    otherwise let a naive column slip through an ``is None`` check.
+    """
+    tz = getattr(dtype, "time_zone", None)
+    if tz is None:
+        tz = getattr(dtype, "tz", None)
+    return tz or None
+
+
+# Below this length, treating a secret as a redaction pattern does more
+# damage to error diagnosability than it prevents: a 1-3 char secret is
+# almost certainly present as an incidental substring in any multi-line
+# ODBC error (codes like "08S01", hex bytes, status tokens), and every
+# such match turns the message into ``<redacted>``-spam. AWS keys are
+# >= 20 chars; any password short enough to hit this gate has much bigger
+# problems than a traceback. The boundary password validators in
+# ``sql_query`` / ``redshift_query`` reject < this many chars at input.
+_MIN_SECRET_REDACTION_LEN: int = 4
+
+
+def _redact_secrets(text: str, secrets: Sequence[str]) -> str:
+    """Replace known-secret substrings in ``text`` with ``<redacted>``.
+
+    Some ODBC drivers echo the full connection string (or kwargs they
+    received) verbatim in their error text. This helper is applied to
+    exception messages from ``arrow_odbc`` / the underlying driver
+    before they are surfaced to the caller or to logs. Empty and
+    under-threshold secrets are skipped (see ``_MIN_SECRET_REDACTION_LEN``).
+
+    Secrets are replaced longest-first: if one secret happens to be a
+    prefix/substring of another (e.g. ``password="abc"`` while
+    ``aws_session_token="abc1234"``), a shorter-first pass would turn the
+    longer secret into ``"<redacted>1234"``, leaking the suffix. Sorting
+    descending by length matches the more specific string first.
+    """
+    out = text
+    for s in sorted(filter(None, secrets), key=len, reverse=True):
+        if len(s) < _MIN_SECRET_REDACTION_LEN:
+            continue
+        out = out.replace(s, "<redacted>")
+    return out
+
+
+def _build_dtype_tuple(*names: str) -> tuple[type[pl.DataType], ...]:
+    """Look up Polars dtype classes by name, dropping ones the installed
+    polars version does not export.
+
+    Some dtypes (``pl.Decimal``, occasionally ``pl.Array``) are absent on
+    older polars builds. Building the tuple dynamically keeps module
+    import green on those versions; the missing dtype is simply not
+    checked. ``isinstance(cls, type) and issubclass(cls, pl.DataType)``
+    narrows ``cls`` to ``type[pl.DataType]`` for mypy.
+    """
+    out: list[type[pl.DataType]] = []
+    for name in names:
+        cls: object = getattr(pl, name, None)
+        if isinstance(cls, type) and issubclass(cls, pl.DataType):
+            out.append(cls)
+    return tuple(out)
+
+
+# Numeric dtype classes for the opt-in finiteness checks
+# (CLAUDE.md inbound contract item 4). Shared between sql_query and
+# redshift_query so both ingest paths apply identical semantics.
+_NUMERIC_DTYPE_CLASSES: tuple[type[pl.DataType], ...] = _build_dtype_tuple(
+    "Int8", "Int16", "Int32", "Int64",
+    "UInt8", "UInt16", "UInt32", "UInt64",
+    "Float32", "Float64",
+    "Decimal",
+)
+_FLOAT_DTYPE_CLASSES: tuple[type[pl.DataType], ...] = _build_dtype_tuple(
+    "Float32", "Float64"
+)
 
 #################################################################################################
 # Parse command line arguments (or use defaults in interactive mode), validate all inputs,
@@ -64,6 +149,57 @@ def parse_arguments(
     dev_folder: str,
     prod_folder: str,
 ) -> tuple[datetime.date, datetime.date, str]:
+
+    # ── Step 0: Type-check inbound parameters ────────────────────────────
+    # ``Literal[...]`` and the dataclass-style annotations are enforcement-
+    # free at runtime — without these guards a wrong-type input
+    # (e.g. ``default_startdate=20240101`` int instead of date,
+    # ``dev_folder=Path(...)`` instead of str, or a typo'd
+    # ``default_write_mode``) surfaces as a cryptic ``strftime`` /
+    # ``AttributeError`` deep in the function. Match the inbound-boundary
+    # discipline used by ``_validate_inputs`` and the ``_sql_check_*``
+    # helpers: fail fast with a descriptive ``TypeError`` / ``ValueError``.
+    #
+    # ``isinstance(..., datetime.date)`` accepts ``datetime.datetime`` (a
+    # subclass) — that is intentional and matches existing call sites that
+    # pass ``compute_mtd_date_range`` results; the ``strftime`` calls below
+    # work for both. We do NOT silently coerce a ``datetime.datetime`` to
+    # ``date`` here because the function's own returned values flow through
+    # an explicit ``strptime(...).date()`` pipeline, so the input form is
+    # not load-bearing past the help-text default rendering.
+    if not isinstance(default_startdate, datetime.date):
+        raise TypeError(
+            f"default_startdate must be a datetime.date, got "
+            f"{type(default_startdate).__name__}"
+        )
+    if not isinstance(default_enddate, datetime.date):
+        raise TypeError(
+            f"default_enddate must be a datetime.date, got "
+            f"{type(default_enddate).__name__}"
+        )
+    if default_startdate > default_enddate:
+        raise ValueError(
+            f"default_startdate ({default_startdate}) must be on or before "
+            f"default_enddate ({default_enddate})"
+        )
+    if not isinstance(default_write_mode, str):
+        raise TypeError(
+            f"default_write_mode must be a str, got "
+            f"{type(default_write_mode).__name__}"
+        )
+    if default_write_mode not in ("dev", "prod"):
+        raise ValueError(
+            f"default_write_mode must be 'dev' or 'prod', got "
+            f"{default_write_mode!r}"
+        )
+    if not isinstance(dev_folder, str):
+        raise TypeError(
+            f"dev_folder must be a str, got {type(dev_folder).__name__}"
+        )
+    if not isinstance(prod_folder, str):
+        raise TypeError(
+            f"prod_folder must be a str, got {type(prod_folder).__name__}"
+        )
 
     # ── Step 1: Detect execution mode ────────────────────────────────────
     # Detect a live interactive shell — NOT mere presence of ipykernel in
@@ -97,7 +233,9 @@ def parse_arguments(
     # ── Step 2: Obtain raw string inputs ─────────────────────────────────
     if is_interactive:
         # Interactive mode: convert defaults to YYYYMMDD strings (same format argparse would produce)
-        print("Running in interactive mode. Using default parameters.")
+        logging.getLogger(__name__).info(
+            "parse_arguments: running in interactive mode; using default parameters"
+        )
         start_date_str = default_startdate.strftime("%Y%m%d")
         end_date_str = default_enddate.strftime("%Y%m%d")
         write_to = default_write_mode
@@ -706,7 +844,7 @@ def compute_mtd_date_range(
     combine_type: Literal["union", "intersect"],
 ) -> tuple[datetime.date, datetime.date]:
     """
-    Return (default_enddate, default_startdate) from the combined trading
+    Return (default_startdate, default_enddate) from the combined trading
     calendars of the given venues.
 
     combine_type:
@@ -807,7 +945,7 @@ def compute_mtd_date_range(
         unique_venues=unique_venues,
         combine_type=combine_type,
     )
-    return enddate, startdate
+    return startdate, enddate
 
 ###################################################################################################
 # Define function to lazy scan parquet files, concatenate them into a single polars lazyframe
@@ -896,6 +1034,25 @@ def lazy_parquet(
     # subclass of datetime.date so it passes type checks, but pl.lit() would
     # create a Datetime literal whose time component silently shifts the filter
     # boundary (e.g. noon on Jan 1 excludes the morning of Jan 1).
+    #
+    # tz-aware datetime.datetime is rejected outright. Calling ``.date()`` on
+    # a tz-aware value silently returns the wall-clock date IN THAT TZ
+    # (e.g. ``datetime(2024,1,1,0,0,tzinfo=Tokyo).date()`` is ``date(2024,1,1)``,
+    # representing 2023-12-31 in NY); compared against parquet data stored
+    # in a different tz the filter silently shifts the boundary by up to a
+    # day. Force the caller to perform the tz conversion explicitly so the
+    # reference frame is unambiguous at the call site.
+    for _name, _val in (("start_date", start_date), ("end_date", end_date)):
+        if isinstance(_val, datetime.datetime) and _val.tzinfo is not None:
+            raise TypeError(
+                f"{_name} must be a datetime.date or tz-naive datetime; got "
+                f"tz-aware datetime ({_val!r}). ``.date()`` on a tz-aware "
+                "value silently returns the wall-clock date IN THAT TZ, "
+                "which may cross a calendar boundary versus the parquet "
+                "data's tz. Convert at the call site (e.g. "
+                "``dt.astimezone(target_tz).date()``) and pass a "
+                "datetime.date."
+            )
     if isinstance(start_date, datetime.datetime):
         start_date = start_date.date()
     if isinstance(end_date, datetime.datetime):
@@ -1054,9 +1211,18 @@ def lazy_parquet(
     ref_name = Path(reference_path).name
     ref_cols = set(reference_schema.keys())
 
+    # Cap the rendered diff to avoid multi-megabyte exception text on a
+    # widespread upstream schema drift (e.g. 5000 files all diverging from
+    # the reference). We still scan every file so the ``total_mismatches``
+    # count is accurate; only the per-file rendering stops at the cap.
+    _MISMATCH_REPORT_CAP = 20
     mismatches: list[str] = []
+    total_mismatches = 0
     for path, schema in schemas.items():
         if schema == reference_schema:
+            continue
+        total_mismatches += 1
+        if len(mismatches) >= _MISMATCH_REPORT_CAP:
             continue
         file_name = Path(path).name
         cur_cols = set(schema.keys())
@@ -1081,10 +1247,18 @@ def lazy_parquet(
                 + "\n".join(dtype_diffs)
             )
 
-    if mismatches:
+    if total_mismatches:
+        suffix = ""
+        if total_mismatches > _MISMATCH_REPORT_CAP:
+            suffix = (
+                f"\n  (+{total_mismatches - _MISMATCH_REPORT_CAP} more "
+                f"mismatching file(s) suppressed; total={total_mismatches} "
+                f"of {len(schemas)} scanned)"
+            )
         raise ValueError(
             f"Schema mismatch across parquet files in {folder_path}:\n"
             + "\n".join(mismatches)
+            + suffix
         )
 
     # Validate date_column exists and is Date or Datetime before building lazy filters.
@@ -1110,9 +1284,9 @@ def lazy_parquet(
     # data is America/New_York wall time (see the docstring) — callers
     # who need to attach it explicitly should do so upstream via
     # ``pl.col(...).dt.replace_time_zone("America/New_York")``.
-    # ``_datetime_tz`` (defined later in this module, resolved at call
-    # time) abstracts over polars' pre-/post-0.18 attribute rename
-    # (``tz`` → ``time_zone``) so older installs don't AttributeError.
+    # ``_datetime_tz`` abstracts over polars' pre-/post-0.18 attribute
+    # rename (``tz`` → ``time_zone``) so older installs don't
+    # AttributeError.
     if require_tz_aware_timestamps and isinstance(col_dtype, pl.Datetime):
         if _datetime_tz(col_dtype) is None:
             raise TypeError(
@@ -1368,6 +1542,21 @@ def _validate_winsorized_schema(
     return idx_dtype, val_dtype
 
 
+## Polars duration-string patterns used by ``_validate_winsorized_window_string``.
+## Compiled at module load (not per-call) for consistency with other module-level
+## regexes (e.g. ``_WINDOWS_ILLEGAL_CHARS``) and to avoid the per-call lookup in
+## the ``re`` cache. The three patterns are consumed independently:
+##   * ``_WINSOR_FULL_RE`` — fullmatch the entire window string against one or
+##     more ``<digits><unit>`` tokens.
+##   * ``_WINSOR_UNITS_RE`` — extract just the unit tokens for the
+##     temporal-vs-integer cross-check against ``idx_dtype``.
+##   * ``_WINSOR_COMPONENT_RE`` — extract ``(magnitude, unit)`` pairs for the
+##     zero-total-magnitude rejection.
+_WINSOR_FULL_RE: re.Pattern[str] = re.compile(r"(\d+(ns|us|ms|mo|[smhdwqyi]))+")
+_WINSOR_UNITS_RE: re.Pattern[str] = re.compile(r"(ns|us|ms|mo|[smhdwqyi])")
+_WINSOR_COMPONENT_RE: re.Pattern[str] = re.compile(r"(\d+)(ns|us|ms|mo|[smhdwqyi])")
+
+
 def _validate_winsorized_window_string(
     window: str,
     index_col: str,
@@ -1380,9 +1569,7 @@ def _validate_winsorized_window_string(
     mismatched cases here turns opaque mid-plan parse errors into
     actionable messages.
     """
-    _units_re = re.compile(r"(ns|us|ms|mo|[smhdwqyi])")
-    _window_components_re = re.compile(r"(\d+)(ns|us|ms|mo|[smhdwqyi])")
-    if not re.fullmatch(r"(\d+(ns|us|ms|mo|[smhdwqyi]))+", window):
+    if not _WINSOR_FULL_RE.fullmatch(window):
         raise ValueError(
             f"window {window!r} is not a valid polars duration string; "
             f"expected e.g. '30s', '5m', '1d', '1mo', '10i' (or compound "
@@ -1390,12 +1577,12 @@ def _validate_winsorized_window_string(
         )
     # Zero-magnitude windows ("0s", "0i", "0d0h") trigger a deep polars
     # "window must be positive" error; catch it here.
-    if all(int(mag) == 0 for mag, _ in _window_components_re.findall(window)):
+    if all(int(mag) == 0 for mag, _ in _WINSOR_COMPONENT_RE.findall(window)):
         raise ValueError(
             f"window {window!r} has zero total magnitude; rolling windows "
             f"must be strictly positive"
         )
-    window_units = _units_re.findall(window)
+    window_units = _WINSOR_UNITS_RE.findall(window)
     if idx_dtype.is_integer():
         if any(u != "i" for u in window_units):
             raise ValueError(
@@ -1827,6 +2014,13 @@ def plot_time_series(
         Examples: ``"{x:.3f}"``, ``"{x:.1f}K"`` (caller must pre-scale),
         ``"{x:.1f}B"`` (caller must pre-scale).
 
+    The returned figure is OPEN (not ``plt.close()``-ed). The caller owns
+    the lifecycle: pass it to ``save_matplotlib_charts_as_html`` (which
+    closes after savefig) or call ``plt.close(fig)`` explicitly. Returning
+    a closed figure would force ``fig.savefig`` to rely on undocumented
+    matplotlib behavior (a closed figure has no canvas/manager) and
+    breaks under future backend changes.
+
     Raises
     ------
     TypeError
@@ -1942,11 +2136,12 @@ def plot_time_series(
         # no-op, so gating here is strictly a headless-Linux safety net.
         if plt.isinteractive():
             plt.show()
-        # Close the specific figure we just created.  plt.close() with no
-        # argument closes pyplot's *current* figure, which may not be
-        # ``fig`` if any other figure was created between the subplots
-        # call and here.  Explicit fig avoids that footgun.
-        plt.close(fig)
+        # Return the figure OPEN — the caller owns the lifecycle. A
+        # downstream ``fig.savefig(...)`` on a ``plt.close()``-ed figure
+        # currently happens to work (Figure object retains state) but is
+        # backend- and version-dependent; matplotlib does not contract
+        # ``savefig`` on a closed figure. Leaving the figure open keeps
+        # the chart pipeline robust against future backend changes.
         return fig
     except Exception:
         plt.close(fig)
@@ -1984,7 +2179,15 @@ def save_matplotlib_charts_as_html(
     file_name_prefix : str
         Used for the HTML filename and page title.
     figures : list[Figure]
-        Already-created matplotlib Figure objects (e.g. [fig1, fig3, ...]).
+        Already-created matplotlib Figure objects (e.g. ``[fig1, fig3, ...]``).
+        **Side effect: the function consumes each figure and calls
+        ``plt.close(fig)`` after a successful ``savefig`` to release canvas
+        memory eagerly** (long batch jobs / notebook sessions building dozens
+        of figures would otherwise accumulate pyplot state). On the failure
+        path (e.g. ``savefig`` raising, or the aggregate-size cap firing
+        mid-loop) figures are NOT closed — the caller's exception handler
+        decides whether to discard or recover them. Do not pass figures that
+        you intend to reuse downstream after this call returns.
 
     Returns
     -------
@@ -2003,6 +2206,23 @@ def save_matplotlib_charts_as_html(
             raise TypeError(
                 f"figures[{i}] is {type(fig).__name__}, expected matplotlib Figure"
             )
+
+    # Type checks before string-level checks so a non-str input fails
+    # with a clear message instead of a cryptic ``AttributeError`` from
+    # ``42.strip()`` further down. Mirrors ``_validate_inputs``.
+    if not isinstance(write_directory, str):
+        raise TypeError(
+            f"write_directory must be a str, got {type(write_directory).__name__}"
+        )
+    if not isinstance(subfolder, str):
+        raise TypeError(
+            f"subfolder must be a str, got {type(subfolder).__name__}"
+        )
+    if not isinstance(file_name_prefix, str):
+        raise TypeError(
+            f"file_name_prefix must be a str, got "
+            f"{type(file_name_prefix).__name__}"
+        )
 
     # Reuse the same string-level checks that save_results applies
     if not write_directory or not write_directory.strip():
@@ -2053,6 +2273,7 @@ def save_matplotlib_charts_as_html(
         raise ValueError(
             f"file_name_prefix uses a reserved Windows device name: {file_name_prefix!r}"
         )
+    _reject_dot_only_basename(file_name_prefix, field="file_name_prefix")
 
     # ── Step 2: Resolve folder path with traversal check ────────────────
     folder_path = _resolve_folder_path(write_directory, subfolder)
@@ -2103,11 +2324,10 @@ def save_matplotlib_charts_as_html(
             try:
                 fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
             except Exception as e:
-                # fig.savefig can fail if the figure was already closed
-                # upstream, its canvas is in a bad state, or dpi × size
-                # overflows memory.  Wrap with index + title context so the
-                # caller can identify the offending figure without digging
-                # through a raw matplotlib stack trace.
+                # fig.savefig can fail if its canvas is in a bad state or
+                # dpi × size overflows memory.  Wrap with index + title
+                # context so the caller can identify the offending figure
+                # without digging through a raw matplotlib stack trace.
                 raise RuntimeError(
                     f"save_matplotlib_charts_as_html: fig.savefig failed "
                     f"for figures[{i}] (title={raw_title!r}). "
@@ -2117,6 +2337,13 @@ def save_matplotlib_charts_as_html(
             b64 = base64.b64encode(buf.read()).decode("ascii")
         finally:
             buf.close()
+        # Close after savefig succeeds: this function consumes each
+        # figure (renders to PNG bytes, embeds in HTML), so eagerly
+        # releasing canvas memory keeps long notebook sessions / batch
+        # jobs that build dozens of figures from accumulating pyplot
+        # state.  Failure paths above re-raise without closing — the
+        # caller's exception handler can decide whether to discard.
+        plt.close(fig)
 
         # Enforce the aggregate HTML-size cap incrementally.  Fail-fast
         # with the offending figure's index + title so the caller can
@@ -2169,7 +2396,9 @@ def save_matplotlib_charts_as_html(
                 pass  # Temp file may not exist if os.open failed
         raise
 
-    print(f"Saved charts HTML to {file_path}")
+    logging.getLogger(__name__).info(
+        "save_matplotlib_charts_as_html: saved charts HTML to %s", file_path
+    )
     return file_path
 
 
@@ -2193,6 +2422,34 @@ _WINDOWS_ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_NAMES = re.compile(
     r"^(con|prn|aux|nul|com[0-9]|lpt[0-9])$", re.IGNORECASE
 )
+
+
+def _reject_dot_only_basename(name: str, *, field: str) -> None:
+    """Reject ``name`` if it consists exclusively of ``.`` characters.
+
+    Inputs like ``"."`` / ``".."`` / ``"..."`` slip past the empty /
+    whitespace / illegal-char / reserved-device checks and produce
+    filenames such as ``..parquet`` and ``...parquet`` that are real
+    operational footguns:
+
+      * A downstream cleanup typo like ``rm ..parquet`` (suffix
+        forgotten) becomes ``rm ..`` and targets the parent directory.
+      * Shell globs (``ls .*parquet``) silently include or exclude
+        these entries based on dotglob settings, masking the file in
+        directory listings.
+      * On NTFS / SMB, ``..something`` is occasionally normalized in
+        ways that produce inconsistent cross-tool views of the file.
+
+    Raises ``ValueError`` (caller picks the field name in the message);
+    this helper covers the contract gap shared by ``_validate_inputs``
+    and ``save_matplotlib_charts_as_html``'s inline validators.
+    """
+    if name and name.strip(".") == "":
+        raise ValueError(
+            f"{field}={name!r} consists entirely of '.' characters; the "
+            "resulting filename (e.g. '..parquet') is operationally "
+            "ambiguous. Use a name with at least one non-dot character."
+        )
 
 ## Safe errno access: these POSIX constants may be absent on some Windows Python builds.
 ## Using -1 as sentinel ensures they never accidentally match a real errno value.
@@ -2343,6 +2600,23 @@ def _validate_inputs(
     if dataframe.is_empty():
         raise ValueError("Cannot save an empty DataFrame")
 
+    # --- type checks: catch non-str inputs at the boundary instead of
+    # letting ``not value or not value.strip()`` raise a cryptic
+    # ``AttributeError`` (e.g. ``42.strip()``) further down.
+    if not isinstance(write_directory, str):
+        raise TypeError(
+            f"write_directory must be a str, got {type(write_directory).__name__}"
+        )
+    if not isinstance(subfolder, str):
+        raise TypeError(
+            f"subfolder must be a str, got {type(subfolder).__name__}"
+        )
+    if not isinstance(file_name_prefix, str):
+        raise TypeError(
+            f"file_name_prefix must be a str, got "
+            f"{type(file_name_prefix).__name__}"
+        )
+
     # --- write_directory: must exist on disk right now ---
     if not write_directory or not write_directory.strip():
         raise ValueError("write_directory must not be empty or whitespace")
@@ -2392,6 +2666,7 @@ def _validate_inputs(
         raise ValueError(
             f"file_name_prefix uses a reserved Windows device name: {file_name_prefix!r}"
         )
+    _reject_dot_only_basename(file_name_prefix, field="file_name_prefix")
 
     # NOTE: Basename byte-length and Windows MAX_PATH checks are performed in
     # save_results() AFTER _build_filename() generates the exact filenames.
@@ -2582,12 +2857,17 @@ def _remove_duplicates(
                     except OSError:
                         pass  # If we can't clear it, unlink below will fail (caught)
                     entry.unlink()
-                    print(f"Erased duplicate: {f}")
+                    logging.getLogger(__name__).info(
+                        "save_results: erased superseded duplicate %s", f
+                    )
                 except OSError:
                     pass  # File may be in use by a reader or locked by AV; skip it
     except OSError as e:
         # Directory iteration itself can fail on a network path; warn but don't crash
-        print(f"Warning: Could not complete duplicate cleanup in {folder_path}: {e}")
+        logging.getLogger(__name__).warning(
+            "save_results: could not complete duplicate cleanup in %s: %s",
+            folder_path, e,
+        )
 
 
 def _validate_path_lengths(tmp_path: str) -> None:
@@ -2628,10 +2908,18 @@ def _makedirs_with_retry(folder_path: str) -> None:
     fast so a misconfigured path doesn't stall the pipeline for ~100s.  The
     final attempt lets the OSError propagate so the caller sees the real
     failure.
+
+    On Access Denied (WinError 5 / EACCES) we additionally try to clear the
+    read-only attribute on the closest existing ancestor before the next
+    retry — Isilon backup/compliance tools may set the attribute on parent
+    directories on both Windows (NTFS) and Linux (NFS/SMB).  Mirrors the
+    read-only handling in _atomic_replace and _fsync_and_verify_size so
+    the three NAS-mutating helpers share one resilience model.
     """
+    target = Path(folder_path)
     for _mkdir_attempt in range(12):
         try:
-            Path(folder_path).mkdir(parents=True, exist_ok=True)
+            target.mkdir(parents=True, exist_ok=True)
             return
         except OSError as e:
             win_err = getattr(e, "winerror", 0)
@@ -2646,6 +2934,30 @@ def _makedirs_with_retry(folder_path: str) -> None:
                 raise  # Not a transient NAS/permission error — fail fast
             if _mkdir_attempt == 11:
                 raise  # Exhausted all retries
+            # Access Denied: walk up to the closest existing ancestor and
+            # clear the read-only attribute if it is set.  We can't know
+            # exactly which parent in the chain blocked mkdir; chmodding
+            # the closest existing one is the best-effort heuristic and
+            # matches the failure modes seen on Isilon (compliance tool
+            # marks a freshly created subfolder read-only between our
+            # mkdir attempts).  Bound the walk at the filesystem root so
+            # a pathologically deep symlink loop cannot spin forever.
+            if win_err == 5 or posix_err == errno.EACCES:
+                ancestor = target
+                _walk_limit = 64
+                while _walk_limit > 0 and not ancestor.exists():
+                    parent = ancestor.parent
+                    if parent == ancestor:
+                        break  # Reached filesystem root.
+                    ancestor = parent
+                    _walk_limit -= 1
+                if ancestor.exists():
+                    try:
+                        attrs = ancestor.stat().st_mode
+                        if not (attrs & stat.S_IWRITE):
+                            ancestor.chmod(attrs | stat.S_IWRITE)
+                    except OSError:
+                        pass  # Best-effort chmod; next retry surfaces the real error
             time.sleep(min(15.0, 0.5 * (2**_mkdir_attempt)))  # Backoff: 0.5s … 15s cap
 
 
@@ -3027,11 +3339,12 @@ def _verify_written_size(file_path: str, expected_size: int) -> None:
     # validated its tmp size before os.replace, so the on-disk bytes are
     # a complete, validated parquet from some writer.  Log and return.
     if written_size > expected_size:
-        print(
-            f"Notice: Written size ({written_size}) exceeds expected "
-            f"({expected_size}) for {file_path}. This is consistent with a "
-            f"concurrent task safely overwriting the same partition with a "
-            f"different (larger) compression pass."
+        logging.getLogger(__name__).info(
+            "_verify_written_size: written size (%d) exceeds expected (%d) "
+            "for %s. This is consistent with a concurrent task safely "
+            "overwriting the same partition with a different (larger) "
+            "compression pass.",
+            written_size, expected_size, file_path,
         )
         return
 
@@ -3267,7 +3580,10 @@ def save_results(
                 pass  # tmp may already be gone or still locked; stale cleanup handles it
 
     elapsed = (time.monotonic() - start_time) / 60
-    print(f"Results saved to: {file_path}, Time taken (minutes): {elapsed:.2f}")
+    logging.getLogger(__name__).info(
+        "save_results: results saved to %s; time taken (minutes): %.2f",
+        file_path, elapsed,
+    )
     return file_path
 
 #################################################################################################
@@ -3279,27 +3595,27 @@ class SqlIngestError(RuntimeError):
 # Characters that would let an attacker (or a malformed config value) escape
 # a DRIVER={...} / SERVER=... / DATABASE=... segment and inject arbitrary
 # ODBC connection-string keys.
-_CONN_STR_FORBIDDEN = (";", "{", "}", "\x00", "\n", "\r")
+_SQL_CONN_STR_FORBIDDEN = (";", "{", "}", "\x00", "\n", "\r")
 
 # Generous but finite upper bounds to catch typos without over-constraining.
-_MAX_BATCH_SIZE = 10_000_000
-_MAX_TIMEOUT_SEC = 86_400  # 1 day; beyond this the caller almost certainly meant "no timeout"
-_MAX_ROWS_CAP = 10**12  # trillion-row hard ceiling on the caller-supplied max_rows
-_MAX_VALUE_BYTES = 2**31 - 1  # 2 GiB; SQL Server's per-value MAX-type upper bound
+_SQL_MAX_BATCH_SIZE = 10_000_000
+_SQL_MAX_TIMEOUT_SEC = 86_400  # 1 day; beyond this the caller almost certainly meant "no timeout"
+_SQL_MAX_ROWS_CAP = 10**12  # trillion-row hard ceiling on the caller-supplied max_rows
+_SQL_MAX_VALUE_BYTES = 2**31 - 1  # 2 GiB; SQL Server's per-value MAX-type upper bound
 
 # Whitelist of `Authentication=...` values accepted by the Microsoft SQL
 # ODBC driver. A whitelist (not free-form str) is required because this
 # value is interpolated into the connection string; allowing arbitrary
 # text would reopen the conn-string injection surface we lock down with
-# _CONN_STR_FORBIDDEN.
-_AUTH_REQUIRES_CREDS = frozenset(
+# _SQL_CONN_STR_FORBIDDEN.
+_SQL_AUTH_REQUIRES_CREDS = frozenset(
     {
         "ActiveDirectoryPassword",
         "ActiveDirectoryServicePrincipal",
         "SqlPassword",
     }
 )
-_AUTH_NO_CREDS = frozenset(
+_SQL_AUTH_NO_CREDS = frozenset(
     {
         "ActiveDirectoryIntegrated",
         "ActiveDirectoryMsi",
@@ -3307,10 +3623,16 @@ _AUTH_NO_CREDS = frozenset(
         "ActiveDirectoryInteractive",
     }
 )
-_AUTHENTICATION_VALUES = _AUTH_REQUIRES_CREDS | _AUTH_NO_CREDS
+_SQL_AUTHENTICATION_VALUES = _SQL_AUTH_REQUIRES_CREDS | _SQL_AUTH_NO_CREDS
 
 
-def _check_conn_token(name: str, value: str) -> str:
+# All SQL-Server helpers below are namespaced with _sql_ to prevent silent
+# shadowing by the Redshift section's identically-named helpers (which are
+# defined later in this module and would otherwise be resolved at call
+# time via Python's late-binding module-globals lookup, causing
+# ``sql_query`` to raise ``RedshiftIngestError`` instead of the
+# ``SqlIngestError`` its docstring promises).
+def _sql_check_conn_token(name: str, value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise SqlIngestError(
             f"{name} must be a non-empty, non-whitespace str, got "
@@ -3325,7 +3647,7 @@ def _check_conn_token(name: str, value: str) -> str:
             f"{name} has leading/trailing whitespace: {value!r}. "
             "Strip at the call site for consistent cross-platform behavior."
         )
-    for ch in _CONN_STR_FORBIDDEN:
+    for ch in _SQL_CONN_STR_FORBIDDEN:
         if ch in value:
             raise SqlIngestError(
                 f"{name} contains forbidden character {ch!r}: {value!r}"
@@ -3334,7 +3656,7 @@ def _check_conn_token(name: str, value: str) -> str:
 
 
 @overload
-def _check_int(
+def _sql_check_int(
     name: str,
     value: int | None,
     *,
@@ -3345,7 +3667,7 @@ def _check_int(
 
 
 @overload
-def _check_int(
+def _sql_check_int(
     name: str,
     value: int | None,
     *,
@@ -3355,7 +3677,7 @@ def _check_int(
 ) -> int | None: ...
 
 
-def _check_int(
+def _sql_check_int(
     name: str,
     value: int | None,
     *,
@@ -3380,7 +3702,7 @@ def _check_int(
     return value
 
 
-def _check_bool(name: str, value: bool) -> None:
+def _sql_check_bool(name: str, value: bool) -> None:
     # Guard against truthy-string / int-1 sneaking in through kwargs.
     if not isinstance(value, bool):
         raise SqlIngestError(
@@ -3388,20 +3710,20 @@ def _check_bool(name: str, value: bool) -> None:
         )
 
 
-def _check_optional_bool(name: str, value: bool | None) -> None:
+def _sql_check_optional_bool(name: str, value: bool | None) -> None:
     if value is None:
         return
-    _check_bool(name, value)
+    _sql_check_bool(name, value)
 
 
-def _check_optional_str(name: str, value: str | None) -> None:
+def _sql_check_optional_str(name: str, value: str | None) -> None:
     if value is not None and not isinstance(value, str):
         raise SqlIngestError(
             f"{name} must be str or None, got {type(value).__name__}={value!r}"
         )
 
 
-def _check_no_control_chars(name: str, value: str) -> None:
+def _sql_check_no_control_chars(name: str, value: str) -> None:
     """Reject NUL / LF / CR inside a credential or similar token.
 
     These are almost always artifacts of reading the value from stdin or
@@ -3419,30 +3741,22 @@ def _check_no_control_chars(name: str, value: str) -> None:
             )
 
 
-def _find_duplicates(names: Sequence[str]) -> list[str]:
+def _sql_find_duplicates(names: Sequence[str]) -> list[str]:
+    # Companion ``dupes_seen`` set keeps dedup-of-dupes O(1); without it
+    # ``n not in dupes`` would degrade to O(n^2) on a pathological
+    # multi-thousand-column result.
     seen: set[str] = set()
+    dupes_seen: set[str] = set()
     dupes: list[str] = []
     for n in names:
-        if n in seen and n not in dupes:
+        if n in seen and n not in dupes_seen:
             dupes.append(n)
+            dupes_seen.add(n)
         seen.add(n)
     return sorted(dupes)
 
 
-def _datetime_tz(dtype: pl.DataType) -> str | None:
-    """Return the timezone of a Polars Datetime dtype, or None if naive.
-
-    Polars renamed the attribute from ``tz`` to ``time_zone`` around 0.18;
-    check both so older installs don't crash with ``AttributeError`` when
-    the caller opts into ``require_tz_aware_timestamps``.
-    """
-    tz = getattr(dtype, "time_zone", None)
-    if tz is None:
-        tz = getattr(dtype, "tz", None)
-    return tz
-
-
-def _normalize_server(server: str) -> tuple[str, bool]:
+def _sql_normalize_server(server: str) -> tuple[str, bool]:
     """Return ``(server_value, emit_verbatim)``.
 
     When ``emit_verbatim`` is True the caller must build
@@ -3519,7 +3833,7 @@ def _normalize_server(server: str) -> tuple[str, bool]:
     return s, False
 
 
-def _validate_parameters(
+def _sql_validate_parameters(
     parameters: Sequence[str | None] | None,
 ) -> list[str | None] | None:
     if parameters is None:
@@ -3548,7 +3862,67 @@ def _validate_parameters(
     return params
 
 
-def _validate_expected_columns(
+def _sql_check_finite_numerics(
+    df: pl.DataFrame, *, require: bool
+) -> None:
+    """Reject NULL / NaN / +-Inf in numeric columns when ``require=True``.
+
+    Implements CLAUDE.md inbound boundary contract item 4 ("Finiteness")
+    for the SQL-Server ingest path. For Int/UInt/Decimal columns we
+    reject only NULL (those types cannot represent NaN/Inf). For
+    Float32/Float64 we additionally reject NaN / +Inf / -Inf via
+    ``is_finite``. Defaults off because SQL Server NULL columns are a
+    documented expectation per CLAUDE.md ("except where NaN is documented
+    as expected"); enable explicitly for tables where NULL/NaN indicates
+    upstream corruption.
+
+    Polars-call exceptions are wrapped to ``SqlIngestError`` to keep the
+    wrapper's "all failures surface as ``SqlIngestError``" contract intact
+    on dtype-API drift across polars releases. The loop does NOT abort on
+    the first polars-side exception: data violations on other columns are
+    still collected and surfaced, with the API-error column listed
+    alongside.
+    """
+    if not require:
+        return
+    bad: list[str] = []
+    api_errors: list[tuple[str, Exception]] = []
+    for name, dtype in df.schema.items():
+        if not isinstance(dtype, _NUMERIC_DTYPE_CLASSES):
+            continue
+        try:
+            if df[name].null_count() > 0:
+                bad.append(name)
+                continue
+            if isinstance(dtype, _FLOAT_DTYPE_CLASSES):
+                # ``is_finite`` returns False for NaN / +Inf / -Inf. On an
+                # empty Series ``.all()`` returns True (vacuous), which is
+                # the correct semantics — nothing to violate.
+                if not bool(df[name].is_finite().all()):
+                    bad.append(name)
+        except Exception as exc:  # noqa: BLE001
+            api_errors.append((name, exc))
+    if bad:
+        msg = (
+            "require_finite_numerics=True but numeric columns contain "
+            f"NULL / NaN / Inf: {bad}"
+        )
+        if api_errors:
+            err_cols = [n for n, _ in api_errors]
+            msg += (
+                " (additionally, the check could not be evaluated on "
+                f"columns: {err_cols})"
+            )
+        raise SqlIngestError(msg)
+    if api_errors:
+        bad_name, api_err = api_errors[0]
+        raise SqlIngestError(
+            f"finiteness check failed on column {bad_name!r}: "
+            f"{type(api_err).__name__}: {api_err}"
+        ) from api_err
+
+
+def _sql_validate_expected_columns(
     expected_columns: Sequence[str] | None,
 ) -> list[str] | None:
     if expected_columns is None:
@@ -3571,7 +3945,7 @@ def _validate_expected_columns(
                 f"expected_columns[{i}] must be non-empty str, got "
                 f"{type(c).__name__}={c!r}"
             )
-    dupes = _find_duplicates(out)
+    dupes = _sql_find_duplicates(out)
     if dupes:
         raise SqlIngestError(f"expected_columns contains duplicates: {dupes}")
     return out
@@ -3600,6 +3974,7 @@ def sql_query(
     allow_extra_columns: bool = False,
     require_non_empty: bool = False,
     require_tz_aware_timestamps: bool = False,
+    require_finite_numerics: bool = False,
 ) -> pl.DataFrame:
     """Run a SELECT against SQL Server and return a Polars DataFrame.
 
@@ -3703,11 +4078,13 @@ def sql_query(
             clear ODBC error.
       * Named-instance syntax (``HOST\\INSTANCE``) works on both
         platforms (SQL Browser discovery over UDP 1434).
-      * ``login_timeout_sec=0`` is accepted for API symmetry but is
-        interpreted differently across driver versions and platforms —
-        some treat it as "fail immediately" and some as "use driver
-        default (~15 s)". Prefer an explicit positive value (e.g. 30)
-        for predictable behavior everywhere.
+      * ``login_timeout_sec`` and ``query_timeout_sec`` reject ``0``:
+        the ODBC convention treats ``0`` as "no timeout", but a connect
+        / query that hangs forever is almost always a misconfig
+        (firewall blackhole, wrong host) rather than something a caller
+        actually wants. Pass a positive int for a real cap, or
+        ``query_timeout_sec=None`` to opt out explicitly. Matches
+        ``redshift_query``.
 
     Multiple result sets: ``arrow_odbc`` materializes only the FIRST
     result set produced by the statement; subsequent result sets from
@@ -3723,6 +4100,15 @@ def sql_query(
     inbound contract that every Datetime column carries a timezone
     (rejects SQL Server ``datetime2`` / ``datetime`` columns unless your
     query casts them to ``datetimeoffset``).
+
+    Set ``require_finite_numerics=True`` to enforce the CLAUDE.md
+    inbound contract item 4 ("Finiteness"). Every numeric column —
+    ``Int*`` / ``UInt*`` / ``Decimal`` / ``Float32`` / ``Float64`` —
+    must be entirely free of NULL; float columns additionally must be
+    free of ``NaN`` / ``+Inf`` / ``-Inf``. Defaults off because SQL
+    Server NULL is a documented expectation in many tables (per
+    CLAUDE.md's "except where NaN is documented as expected"); enable
+    only for tables where NULL/NaN indicates upstream corruption.
 
     Output contract:
       * Column order and names are preserved exactly as SQL Server returns
@@ -3743,9 +4129,9 @@ def sql_query(
     threads without their own synchronization (standard Polars rules).
     """
     # --- input validation (inbound boundary) ---------------------------------
-    _check_conn_token("server", server)
-    _check_conn_token("database", database)
-    _check_conn_token("driver", driver)
+    _sql_check_conn_token("server", server)
+    _sql_check_conn_token("database", database)
+    _sql_check_conn_token("driver", driver)
 
     # Normalize known driver strings to fix unixODBC case-sensitivity on Linux
     _known_drivers = {
@@ -3773,43 +4159,60 @@ def sql_query(
             "file as plain UTF-8, or strip via query.replace('\\ufeff', '')"
         )
 
-    _check_int("port", port, minv=1, maxv=65_535)
-    _check_int("batch_size", batch_size, minv=1, maxv=_MAX_BATCH_SIZE)
-    _check_int(
-        "login_timeout_sec", login_timeout_sec, minv=0, maxv=_MAX_TIMEOUT_SEC
+    _sql_check_int("port", port, minv=1, maxv=65_535)
+    _sql_check_int("batch_size", batch_size, minv=1, maxv=_SQL_MAX_BATCH_SIZE)
+    # ``login_timeout_sec=0`` is the ODBC convention for "no timeout"
+    # — a connect that hangs forever is almost always a misconfig
+    # (firewall blackhole, wrong host) rather than something a caller
+    # actually wants. Force a positive bound; if "very long" is truly
+    # desired, ``_SQL_MAX_TIMEOUT_SEC`` (1 day) is the practical
+    # ceiling. Matches ``redshift_query``'s ``_validate_numeric_params``.
+    _sql_check_int(
+        "login_timeout_sec", login_timeout_sec, minv=1, maxv=_SQL_MAX_TIMEOUT_SEC
     )
-    _check_int(
+    # ``query_timeout_sec=None`` is the explicit "no timeout" path
+    # (allow_none=True). Reject the implicit ``=0`` ODBC sentinel so
+    # the caller has to choose deliberately between a positive cap
+    # and ``None``; mixing the two conventions hides intent at the
+    # call site. Matches ``redshift_query``'s ``_validate_numeric_params``.
+    _sql_check_int(
         "query_timeout_sec",
         query_timeout_sec,
-        minv=0,
-        maxv=_MAX_TIMEOUT_SEC,
+        minv=1,
+        maxv=_SQL_MAX_TIMEOUT_SEC,
         allow_none=True,
     )
-    max_rows_val = _check_int(
-        "max_rows", max_rows, minv=0, maxv=_MAX_ROWS_CAP, allow_none=True
+    # ``max_rows=0`` is degenerate: any non-empty result aborts and an
+    # empty result trivially passes — equivalent to ``LIMIT 0`` on the
+    # server side, which is the right place to express it.  Force a
+    # positive cap so the parameter's intent ("abort runaway streaming
+    # above N rows") is unambiguous, matching ``redshift_query``.
+    max_rows_val = _sql_check_int(
+        "max_rows", max_rows, minv=1, maxv=_SQL_MAX_ROWS_CAP, allow_none=True
     )
-    _check_int(
+    _sql_check_int(
         "max_text_size",
         max_text_size,
         minv=1,
-        maxv=_MAX_VALUE_BYTES,
+        maxv=_SQL_MAX_VALUE_BYTES,
         allow_none=True,
     )
-    _check_int(
+    _sql_check_int(
         "max_binary_size",
         max_binary_size,
         minv=1,
-        maxv=_MAX_VALUE_BYTES,
+        maxv=_SQL_MAX_VALUE_BYTES,
         allow_none=True,
     )
-    _check_bool("require_non_empty", require_non_empty)
-    _check_bool("allow_extra_columns", allow_extra_columns)
-    _check_bool("require_tz_aware_timestamps", require_tz_aware_timestamps)
-    _check_optional_bool("encrypt", encrypt)
-    _check_optional_bool("trust_server_certificate", trust_server_certificate)
+    _sql_check_bool("require_non_empty", require_non_empty)
+    _sql_check_bool("allow_extra_columns", allow_extra_columns)
+    _sql_check_bool("require_tz_aware_timestamps", require_tz_aware_timestamps)
+    _sql_check_bool("require_finite_numerics", require_finite_numerics)
+    _sql_check_optional_bool("encrypt", encrypt)
+    _sql_check_optional_bool("trust_server_certificate", trust_server_certificate)
 
-    _check_optional_str("user", user)
-    _check_optional_str("password", password)
+    _sql_check_optional_str("user", user)
+    _sql_check_optional_str("password", password)
     if (user is None) != (password is None):
         raise SqlIngestError(
             "user and password must be supplied together, or both omitted "
@@ -3819,35 +4222,51 @@ def sql_query(
     if user is not None:
         if not user:
             raise SqlIngestError("user must be non-empty when provided")
-        _check_no_control_chars("user", user)
+        _sql_check_no_control_chars("user", user)
     if password is not None:
         if not password:
             # Empty password is almost always an unset-env-var typo; reject
             # so the caller finds out at our boundary, not via a cryptic
             # ODBC auth failure later.
             raise SqlIngestError("password must be non-empty when provided")
-        _check_no_control_chars("password", password)
+        _sql_check_no_control_chars("password", password)
+        # ``_redact_secrets`` skips substrings shorter than
+        # ``_MIN_SECRET_REDACTION_LEN`` to avoid destroying error
+        # readability. Without a matching boundary reject, a caller with
+        # e.g. ``password="abc"`` (3 chars) would have their password
+        # slip through both the redaction helper (skipped) AND appear
+        # verbatim in any driver error that echoes the value. Reject at
+        # the boundary so the two thresholds stay coherent. Length, not
+        # entropy, is enforced here — entropy is a caller / IAM-policy
+        # concern.
+        if len(password) < _MIN_SECRET_REDACTION_LEN:
+            raise SqlIngestError(
+                f"password must be at least {_MIN_SECRET_REDACTION_LEN} "
+                "characters; shorter values cannot be safely redacted "
+                "from driver error messages and would leak if the "
+                "connection string or driver kwargs are echoed."
+            )
 
-    _check_optional_str("authentication", authentication)
+    _sql_check_optional_str("authentication", authentication)
     if authentication is not None:
-        if authentication not in _AUTHENTICATION_VALUES:
+        if authentication not in _SQL_AUTHENTICATION_VALUES:
             raise SqlIngestError(
                 f"authentication={authentication!r} not in whitelist; "
-                f"allowed: {sorted(_AUTHENTICATION_VALUES)}"
+                f"allowed: {sorted(_SQL_AUTHENTICATION_VALUES)}"
             )
-        if authentication in _AUTH_REQUIRES_CREDS and user is None:
+        if authentication in _SQL_AUTH_REQUIRES_CREDS and user is None:
             raise SqlIngestError(
                 f"authentication={authentication!r} requires user and password"
             )
-        if authentication in _AUTH_NO_CREDS and user is not None:
+        if authentication in _SQL_AUTH_NO_CREDS and user is not None:
             raise SqlIngestError(
                 f"authentication={authentication!r} must not be combined "
                 "with user/password"
             )
 
-    params = _validate_parameters(parameters)
-    expected = _validate_expected_columns(expected_columns)
-    server_canon, emit_server_verbatim = _normalize_server(server)
+    params = _sql_validate_parameters(parameters)
+    expected = _sql_validate_expected_columns(expected_columns)
+    server_canon, emit_server_verbatim = _sql_normalize_server(server)
 
     # --- build connection string ---------------------------------------------
     # Trusted auth only kicks in when the caller supplied neither SQL creds
@@ -3864,7 +4283,7 @@ def sql_query(
     # Brace-quote DATABASE for symmetry with DRIVER so values containing
     # "=" or other ODBC-reserved punctuation can never be mis-parsed by
     # downstream tools (some driver managers, proxies, and monitoring
-    # probes tokenize loosely).  `_check_conn_token` already rejects `{`,
+    # probes tokenize loosely).  `_sql_check_conn_token` already rejects `{`,
     # `}`, `;`, NUL, CR, LF in `database`, so brace-quoting is closed-form
     # safe — the value can never contain the closing `}` that would break
     # the quoting.
@@ -3893,97 +4312,151 @@ def sql_query(
     conn_str = ";".join(parts) + ";"
 
     # --- open reader ---------------------------------------------------------
-    try:
-        reader = read_arrow_batches_from_odbc(
-            connection_string=conn_str,
-            query=query,
-            batch_size=batch_size,
-            user=user,
-            password=password,
-            parameters=params,
-            login_timeout_sec=login_timeout_sec,
-            query_timeout_sec=query_timeout_sec,
-            max_text_size=max_text_size,
-            max_binary_size=max_binary_size,
-        )
-    except TypeError as exc:
-        # arrow_odbc added `max_text_size` / `max_binary_size` /
-        # `query_timeout_sec` in different releases; an "unexpected
-        # keyword argument" here almost certainly means the installed
-        # arrow_odbc is older than this wrapper expects.
-        raise SqlIngestError(
-            f"arrow_odbc rejected a keyword argument "
-            f"(likely a version mismatch): {exc}"
-        ) from exc
-    except Exception as exc:  # arrow_odbc raises a variety of native errors
-        raise SqlIngestError(
-            f"failed to open ODBC reader against {server_canon}/{database}: {exc}"
-        ) from exc
-
-    if reader is None:
-        # arrow_odbc returns None for statements with no result set
-        # (INSERT/UPDATE/DDL). sql_query is defined only for SELECT.
-        raise SqlIngestError(
-            "query produced no result set; sql_query expects a SELECT"
-        )
-
-    # All reader usage (schema read, batch streaming) is wrapped so that the
-    # ODBC cursor is released synchronously in every exit path — normal
-    # return, caller-facing raise, or unexpected raise. In CPython this
-    # triggers arrow_odbc's Rust Drop immediately, so the server-side cursor
-    # is closed before the SqlIngestError propagates up the stack.
-    batches: list[pa.RecordBatch] = []
-    total_rows = 0
-    over_cap = False
+    # ``secrets`` gathers every credential that could appear in a driver-
+    # echoed error message. Some ODBC drivers echo the connection string
+    # or kwargs verbatim in their error text; we scrub these substrings
+    # from any propagated arrow_odbc / driver exception text before
+    # surfacing it to the caller or to logs. ``raise ... from None``
+    # (rather than ``from exc``) keeps the original (unredacted) cause
+    # off the default traceback.
+    #
+    # Three nested try/finally layers, innermost-first:
+    #   * inner-1 (open):    clears ``conn_str`` / ``password`` / ``query`` /
+    #                        ``params`` once arrow_odbc has internalized them.
+    #   * inner-2 (stream):  ``del reader`` so arrow_odbc's Rust Drop runs and
+    #                        the server-side cursor closes synchronously
+    #                        before any exception propagates.
+    #   * outer (secrets):   ``secrets = ()`` clears the credential snapshot
+    #                        on EVERY exit path of the function — including
+    #                        an open-stage raise (where streaming never runs)
+    #                        and the None-reader path. Without this layer,
+    #                        ``secrets`` (an immutable tuple holding the
+    #                        original password STRING) survives the open
+    #                        finally and frame-locals dumpers (sentry
+    #                        ``with_locals=True``, cgitb, rich) read it from
+    #                        the propagating exception's frame snapshot.
+    secrets = tuple(s for s in (password,) if s)
     try:
         try:
-            schema = reader.schema
-        except Exception as exc:
-            raise SqlIngestError(
-                f"failed to read arrow schema from ODBC result: {exc}"
-            ) from exc
-        if schema is None:
-            raise SqlIngestError("ODBC result reported a null arrow schema")
+            try:
+                reader = read_arrow_batches_from_odbc(
+                    connection_string=conn_str,
+                    query=query,
+                    batch_size=batch_size,
+                    user=user,
+                    password=password,
+                    parameters=params,
+                    login_timeout_sec=login_timeout_sec,
+                    query_timeout_sec=query_timeout_sec,
+                    max_text_size=max_text_size,
+                    max_binary_size=max_binary_size,
+                )
+            except TypeError as exc:
+                # arrow_odbc added `max_text_size` / `max_binary_size` /
+                # `query_timeout_sec` in different releases; an "unexpected
+                # keyword argument" here almost certainly means the
+                # installed arrow_odbc is older than this wrapper expects.
+                raise SqlIngestError(
+                    f"arrow_odbc rejected a keyword argument "
+                    f"(likely a version mismatch): "
+                    f"{_redact_secrets(str(exc), secrets)}"
+                ) from None
+            except Exception as exc:  # arrow_odbc raises various native errors
+                raise SqlIngestError(
+                    f"failed to open ODBC reader against {server_canon}/{database}: "
+                    f"{_redact_secrets(str(exc), secrets)}"
+                ) from None
+        finally:
+            conn_str = ""
+            password = None
+            query = ""
+            params = None
 
-        # Pre-conversion: reject duplicate arrow field names with a clear
-        # error rather than letting pl.from_arrow raise an opaque
-        # ComputeError.
-        schema_names: list[str] = list(schema.names)
-        schema_dupes = _find_duplicates(schema_names)
-        if schema_dupes:
-            raise SqlIngestError(
-                f"duplicate column names in server result set: {schema_dupes}"
-            )
-
-        # Manual iteration (vs list(reader)) so max_rows can abort early
-        # before we balloon memory on a runaway result.
+        # All reader usage (schema read, batch streaming) is wrapped so the
+        # ODBC cursor is released synchronously in every exit path — normal
+        # return, caller-facing raise, or unexpected raise. In CPython
+        # ``del reader`` triggers arrow_odbc's Rust Drop immediately, so
+        # the server-side cursor closes before any SqlIngestError
+        # propagates up the stack.
+        #
+        # The None-result check is INSIDE this try so its raise also runs
+        # the streaming finally (``del reader`` is fine on a None binding)
+        # and ultimately the outer secrets-clearing finally — preventing
+        # ``secrets`` from leaking on the no-result-set path.
+        batches: list[pa.RecordBatch] = []
+        total_rows = 0
+        over_cap = False
         try:
-            for batch in reader:
-                batches.append(batch)
-                total_rows += batch.num_rows
-                if max_rows_val is not None and total_rows > max_rows_val:
-                    over_cap = True
-                    break
-        except Exception as exc:
-            batches.clear()
-            raise SqlIngestError(
-                f"failed while streaming batches from {server_canon}/{database}: {exc}"
-            ) from exc
+            if reader is None:
+                # arrow_odbc returns None for statements with no result set
+                # (INSERT/UPDATE/DDL). sql_query is defined only for SELECT.
+                raise SqlIngestError(
+                    "query produced no result set; sql_query expects a SELECT"
+                )
+            try:
+                schema = reader.schema
+            except Exception as exc:
+                raise SqlIngestError(
+                    f"failed to read arrow schema from ODBC result: "
+                    f"{_redact_secrets(str(exc), secrets)}"
+                ) from None
+            if schema is None:
+                raise SqlIngestError("ODBC result reported a null arrow schema")
 
-        if over_cap:
-            # `over_cap = True` is only set inside the streaming loop after
-            # the `max_rows_val is not None` guard, so this assert narrows
-            # the type for readers and type-checkers without being a
-            # load-bearing check.
-            assert max_rows_val is not None
-            batches.clear()
-            raise SqlIngestError(
-                f"result exceeded max_rows={max_rows_val}: streamed "
-                f"{total_rows} rows before abort against "
-                f"{server_canon}/{database}"
-            )
+            # Pre-conversion: reject duplicate arrow field names with a
+            # clear error rather than letting pl.from_arrow raise an opaque
+            # ComputeError.
+            schema_names: list[str] = list(schema.names)
+            schema_dupes = _sql_find_duplicates(schema_names)
+            if schema_dupes:
+                raise SqlIngestError(
+                    f"duplicate column names in server result set: "
+                    f"{schema_dupes}"
+                )
+
+            # Manual iteration (vs list(reader)) so max_rows can abort early
+            # before we balloon memory on a runaway result.
+            try:
+                for batch in reader:
+                    batches.append(batch)
+                    total_rows += batch.num_rows
+                    if max_rows_val is not None and total_rows > max_rows_val:
+                        over_cap = True
+                        break
+            except Exception as exc:
+                batches.clear()
+                raise SqlIngestError(
+                    f"failed while streaming batches from "
+                    f"{server_canon}/{database}: "
+                    f"{_redact_secrets(str(exc), secrets)}"
+                ) from None
+
+            if over_cap:
+                # `over_cap = True` is only set inside the streaming loop
+                # after the `max_rows_val is not None` guard, so this assert
+                # narrows the type for readers and type-checkers without
+                # being a load-bearing check.
+                assert max_rows_val is not None
+                batches.clear()
+                raise SqlIngestError(
+                    f"result exceeded max_rows={max_rows_val}: streamed "
+                    f"{total_rows} rows before abort against "
+                    f"{server_canon}/{database}"
+                )
+        finally:
+            # ``del reader`` is safe even when reader is None (the
+            # None-result branch above raised before any reuse): it removes
+            # the local binding regardless of its value, and is unreachable
+            # only on the open-stage raise path (where we never entered
+            # this try and reader was never bound).
+            del reader
     finally:
-        del reader
+        # Outer finally: clear the credential snapshot on EVERY exit path
+        # of the function — open-raise, None-reader, streaming-raise,
+        # streaming-success. Without this, the immutable ``secrets`` tuple
+        # would survive the open finally and be readable from the
+        # propagating exception's frame by sentry/cgitb/rich.
+        secrets = ()
 
     try:
         table = pa.Table.from_batches(batches=batches, schema=schema)
@@ -4036,7 +4509,7 @@ def sql_query(
         )
 
     # --- post-load caller-facing checks --------------------------------------
-    cols_dupes = _find_duplicates(cols)
+    cols_dupes = _sql_find_duplicates(cols)
     if cols_dupes:
         # Unreachable given the pre-conversion schema check, but kept as a
         # defense-in-depth guard against future arrow/polars behavior drift.
@@ -4071,4 +4544,1717 @@ def sql_query(
             "(require_non_empty=True)"
         )
 
+    _sql_check_finite_numerics(df, require=require_finite_numerics)
+
     return df
+
+#################################################################################################
+# Function for reading Amazon Redshift data into a Polars DataFrame, with robust input validation and error handling.
+
+
+class RedshiftIngestError(RuntimeError):
+    """Boundary-contract failure while ingesting from Amazon Redshift."""
+
+
+class _ArrowBatchReader(Protocol):
+    """Structural type for the ``arrow_odbc`` BatchReader surface we use.
+
+    ``arrow_odbc`` is imported as untyped (``type: ignore[import-untyped]``
+    above), so referencing its ``BatchReader`` class by name would cascade
+    ``Any`` through every helper that touches it and fail ``ruff``'s
+    ``ANN401`` under strict typing. Declaring just the two attributes we
+    actually consume (``schema`` and iteration yielding
+    ``pa.RecordBatch``) keeps the typed surface honest and minimizes
+    coupling to upstream internals.
+    """
+
+    @property
+    def schema(self) -> pa.Schema: ...
+
+    def __iter__(self) -> Iterator[pa.RecordBatch]: ...
+
+
+# =============================================================================
+# Module-level constants
+# =============================================================================
+
+# Characters that would let an attacker (or a malformed config value) escape
+# a DRIVER={...} / SERVER=... / DATABASE=... segment and inject arbitrary
+# ODBC connection-string keys.
+_CONN_STR_FORBIDDEN = (";", "{", "}", "\x00", "\n", "\r")
+
+# Characters forbidden inside an individual DbGroups entry. We join groups
+# with "," to form the DbGroups value, so a comma inside a name would be
+# read as two groups by the driver. Whitespace would silently fail the
+# server-side group lookup with a confusing "group not found" error, so
+# reject at the boundary.
+_DB_GROUP_FORBIDDEN = (",", ";", "{", "}", "\x00", "\n", "\r", " ", "\t")
+
+# Generous but finite upper bounds to catch typos without over-constraining.
+_MAX_BATCH_SIZE = 10_000_000
+_MAX_TIMEOUT_SEC = 86_400  # 1 day; beyond this the caller almost certainly meant "no timeout"
+_MAX_ROWS_CAP = 10**12  # trillion-row hard ceiling on the caller-supplied max_rows
+_MAX_VALUE_BYTES = 2**31 - 1  # 2 GiB; ODBC wide-buffer upper bound
+_MAX_DB_GROUPS = 256  # Redshift has no documented hard limit; this catches typos
+
+# Whitelist of SSLMode values supported by the Amazon Redshift ODBC driver.
+# A whitelist is required because the value is interpolated into the
+# connection string; allowing arbitrary text would reopen the conn-string
+# injection surface that _CONN_STR_FORBIDDEN locks down. Values are
+# case-sensitive (the driver matches the canonical lowercase forms below).
+_SSL_MODES = frozenset(
+    {"verify-full", "verify-ca", "require", "prefer", "disable"}
+)
+
+# Fields whose values must NEVER appear in an error message. A wrong-type
+# value here could be a bytes/bytearray-wrapped password that would
+# otherwise be printed verbatim via {value!r}.
+_SENSITIVE_CRED_FIELDS = frozenset(
+    {
+        "password",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    }
+)
+
+# Unicode codepoints forbidden inside ``query`` because they either
+# (a) let a multi-line statement slip past a single-statement tokenizer,
+# or (b) make the reviewed form of the query diverge from the executed
+# form ("Trojan Source" — CVE-2021-42574).
+#
+#   * U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR: some
+#     ODBC/JDBC driver stacks treat these as line terminators inside
+#     their SQL comment / string-literal state machine, letting a
+#     ``-- comment<U+2028>INJECTED`` payload execute after the review
+#     sees only the comment.
+#   * U+202A..U+202E (LRE, RLE, PDF, LRO, RLO) and U+2066..U+2069
+#     (LRI, RLI, FSI, PDI): bidirectional override / isolate controls.
+#     A reviewer sees the visually-reordered query; the driver executes
+#     the logical-order one. Classic source-trojaning vector.
+_QUERY_FORBIDDEN_CODEPOINTS = frozenset(
+    [chr(0x2028), chr(0x2029)]
+    + [chr(cp) for cp in range(0x202A, 0x202F)]
+    + [chr(cp) for cp in range(0x2066, 0x206A)]
+)
+
+
+# =============================================================================
+# Primitive type / range / character checks
+# =============================================================================
+
+
+def _check_conn_token(name: str, value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RedshiftIngestError(
+            f"{name} must be a non-empty, non-whitespace str, got "
+            f"{type(value).__name__}={value!r}"
+        )
+    # Leading/trailing whitespace is silently tolerated by some ODBC driver
+    # managers and rejected by others; rather than silently strip (which
+    # would hide caller-side typos like copy-pasting from docs), reject at
+    # the boundary with an actionable message.
+    if value != value.strip():
+        raise RedshiftIngestError(
+            f"{name} has leading/trailing whitespace: {value!r}. "
+            "Strip at the call site for consistent cross-platform behavior."
+        )
+    for ch in _CONN_STR_FORBIDDEN:
+        if ch in value:
+            raise RedshiftIngestError(
+                f"{name} contains forbidden character {ch!r}: {value!r}"
+            )
+    return value
+
+
+def _check_int(
+    name: str,
+    value: int | None,
+    *,
+    minv: int,
+    maxv: int,
+    allow_none: bool = False,
+) -> int | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise RedshiftIngestError(f"{name} must not be None")
+    # bool is an int subclass in Python; reject explicitly to prevent
+    # `port=True` silently meaning 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RedshiftIngestError(
+            f"{name} must be int, got {type(value).__name__}={value!r}"
+        )
+    if not (minv <= value <= maxv):
+        raise RedshiftIngestError(
+            f"{name} must be in [{minv}, {maxv}], got {value}"
+        )
+    return value
+
+
+def _check_bool(name: str, value: bool) -> None:
+    # Guard against truthy-string / int-1 sneaking in through kwargs.
+    if not isinstance(value, bool):
+        raise RedshiftIngestError(
+            f"{name} must be bool, got {type(value).__name__}={value!r}"
+        )
+
+
+def _check_optional_str(
+    name: str, value: str | None, *, sensitive: bool = False
+) -> None:
+    if value is not None and not isinstance(value, str):
+        # For credential-bearing fields, never echo the rejected value:
+        # a bytes-wrapped password (e.g. reading from stdin without
+        # decoding) would otherwise be printed verbatim into logs.
+        shown = "<redacted>" if sensitive else repr(value)
+        raise RedshiftIngestError(
+            f"{name} must be str or None, got {type(value).__name__}={shown}"
+        )
+
+
+def _check_no_control_chars(name: str, value: str) -> None:
+    """Reject NUL / LF / CR inside a credential or similar token.
+
+    These are almost always artifacts of reading the value from stdin or
+    from a text file without stripping the trailing newline, and the
+    downstream ODBC error message differs by platform, so catch them at
+    our boundary with an actionable message.
+    """
+    for bad in ("\x00", "\n", "\r"):
+        if bad in value:
+            raise RedshiftIngestError(
+                f"{name} contains a control character {bad!r}; commonly "
+                "seen when reading credentials from stdin or a file "
+                "without stripping a trailing newline"
+            )
+
+
+def _check_list_or_tuple(name: str, value: object) -> None:
+    """Require a ``list`` / ``tuple`` where a caller-ordered sequence is expected.
+
+    ``Sequence[str]`` in the annotation is enforcement-free at runtime;
+    three distinct traps would otherwise silently produce wrong results:
+
+    * ``str`` / ``bytes`` / ``bytearray`` are Sequences but iterate
+      character-by-character: ``parameters="?"`` silently becomes a
+      single-char sequence instead of ``["?"]``.
+    * ``set`` / ``frozenset`` are not Sequences but ``list(s)`` still
+      works; iteration order is not a caller contract, which scrambles
+      positional ODBC binding without error.
+    * ``dict`` iterates keys only (values dropped) in insertion order —
+      not what a caller passing a mapping expects.
+
+    Accepting only ``list`` / ``tuple`` makes the caller contract
+    explicit and deterministic.
+    """
+    if isinstance(value, (list, tuple)):
+        return
+    if isinstance(value, (str, bytes, bytearray)):
+        reason = (
+            "a bare string/bytes value would be iterated "
+            "character-by-character"
+        )
+    elif isinstance(value, (set, frozenset, dict)):
+        reason = (
+            "unordered/mapping types iterate in a non-caller-controlled "
+            "order and would silently scramble positional binding"
+        )
+    else:
+        reason = (
+            "only list/tuple carry a deterministic, caller-defined order"
+        )
+    raise RedshiftIngestError(
+        f"{name} must be a list or tuple, not {type(value).__name__}: "
+        f"{reason}. Wrap in a list: {name}=[value] (or list(value))."
+    )
+
+
+def _find_duplicates(names: Sequence[str]) -> list[str]:
+    # Companion ``dupes_seen`` set keeps dedup-of-dupes O(1); without it
+    # ``n not in dupes`` would degrade to O(n^2) on a pathological
+    # 10k-column result (e.g. a SELECT with many aliases that collide
+    # after Redshift's unquoted-identifier lower-casing).
+    seen: set[str] = set()
+    dupes_seen: set[str] = set()
+    dupes: list[str] = []
+    for n in names:
+        if n in seen and n not in dupes_seen:
+            dupes.append(n)
+            dupes_seen.add(n)
+        seen.add(n)
+    return sorted(dupes)
+
+
+# =============================================================================
+# Per-field validators (called from the main function)
+# =============================================================================
+
+
+def _validate_endpoint_identifiers(
+    *, host: str, database: str, driver: str
+) -> None:
+    _check_conn_token("host", host)
+    _check_conn_token("database", database)
+    _check_conn_token("driver", driver)
+
+
+def _validate_query(query: str) -> None:
+    if not isinstance(query, str) or not query.strip():
+        raise RedshiftIngestError(
+            "query must be a non-empty, non-whitespace str"
+        )
+    if "\x00" in query:
+        raise RedshiftIngestError("query contains a null byte")
+    if chr(0xFEFF) in query:
+        # UTF-8 BOM (U+FEFF) leaks in from files saved as "UTF-8 with
+        # BOM" (common on Windows editors / older PowerShell Set-Content)
+        # and from naive concatenation of two such files. Redshift's
+        # parser sees the U+FEFF and fails with a syntax error at
+        # position 0. Reject anywhere in the query, not just at the
+        # start, since mid-string BOMs from file concatenation produce
+        # the same error. ``chr(0xFEFF)`` is used deliberately over a
+        # raw literal in the source so that re-encoding this file
+        # (e.g. saving as UTF-16 via a Windows editor) cannot silently
+        # neutralize the check.
+        raise RedshiftIngestError(
+            "query contains a UTF-8 BOM (U+FEFF); re-save the source "
+            "file as plain UTF-8, or strip via query.replace('\\ufeff', '')"
+        )
+    for bad in _QUERY_FORBIDDEN_CODEPOINTS:
+        if bad in query:
+            raise RedshiftIngestError(
+                f"query contains Unicode codepoint U+{ord(bad):04X}; "
+                "Line/Paragraph separators (U+2028/U+2029) and "
+                "bidirectional override/isolate controls "
+                "(U+202A-U+202E, U+2066-U+2069) can cause "
+                "statement-boundary confusion in ODBC/JDBC tokenizers "
+                "or produce reviewed-vs-executed divergence "
+                "(CVE-2021-42574 'Trojan Source'). Strip at source."
+            )
+
+
+def _validate_numeric_params(
+    *,
+    port: int,
+    batch_size: int,
+    login_timeout_sec: int,
+    query_timeout_sec: int | None,
+    max_rows: int | None,
+    max_text_size: int | None,
+    max_binary_size: int | None,
+) -> int | None:
+    """Bounds-check every int-typed param; return the validated ``max_rows``.
+
+    ``max_rows`` is the only validated value the streaming loop needs back;
+    every other field keeps its original variable name in the caller, so
+    we just check-and-discard.
+    """
+    _check_int("port", port, minv=1, maxv=65_535)
+    _check_int("batch_size", batch_size, minv=1, maxv=_MAX_BATCH_SIZE)
+    # ``login_timeout_sec=0`` is the ODBC convention for "no timeout"
+    # — a connect that hangs forever is almost always a misconfig
+    # (firewall blackhole, wrong host) rather than something a caller
+    # actually wants. Force a positive bound; if "very long" is truly
+    # desired, ``_MAX_TIMEOUT_SEC`` (1 day) is the practical ceiling.
+    _check_int(
+        "login_timeout_sec",
+        login_timeout_sec,
+        minv=1,
+        maxv=_MAX_TIMEOUT_SEC,
+    )
+    # ``query_timeout_sec=None`` is the explicit "no timeout" path
+    # (allow_none=True). Reject the implicit ``=0`` ODBC sentinel so
+    # the caller has to choose deliberately between a positive cap
+    # and ``None``; mixing the two conventions hides intent at the
+    # call site.
+    _check_int(
+        "query_timeout_sec",
+        query_timeout_sec,
+        minv=1,
+        maxv=_MAX_TIMEOUT_SEC,
+        allow_none=True,
+    )
+    # ``max_rows=0`` is degenerate: any non-empty result aborts and
+    # an empty result trivially passes — equivalent to ``LIMIT 0`` on
+    # the server side, which is the right place to express it. Force
+    # a positive cap so the parameter's intent ("abort runaway
+    # streaming above N rows") is unambiguous.
+    max_rows_val = _check_int(
+        "max_rows", max_rows, minv=1, maxv=_MAX_ROWS_CAP, allow_none=True
+    )
+    _check_int(
+        "max_text_size",
+        max_text_size,
+        minv=1,
+        maxv=_MAX_VALUE_BYTES,
+        allow_none=True,
+    )
+    _check_int(
+        "max_binary_size",
+        max_binary_size,
+        minv=1,
+        maxv=_MAX_VALUE_BYTES,
+        allow_none=True,
+    )
+    return max_rows_val
+
+
+def _validate_bool_flags(
+    *,
+    require_non_empty: bool,
+    allow_extra_columns: bool,
+    require_tz_aware_timestamps: bool,
+    require_finite_numerics: bool,
+    iam: bool,
+    auto_create: bool,
+) -> None:
+    _check_bool("require_non_empty", require_non_empty)
+    _check_bool("allow_extra_columns", allow_extra_columns)
+    _check_bool("require_tz_aware_timestamps", require_tz_aware_timestamps)
+    _check_bool("require_finite_numerics", require_finite_numerics)
+    _check_bool("iam", iam)
+    _check_bool("auto_create", auto_create)
+
+
+def _validate_optional_credential_strings(
+    fields: dict[str, str | None],
+) -> None:
+    """Two-pass validation: types first, then content.
+
+    Two passes (rather than one combined sweep) preserve the original's
+    error-ordering contract: a wrong-type field anywhere in the dict
+    surfaces before any content error from another field. That keeps the
+    most fundamental fault first, which matches caller intuition when
+    several fields are misconfigured at once.
+    """
+    for name, value in fields.items():
+        _check_optional_str(
+            name, value, sensitive=name in _SENSITIVE_CRED_FIELDS
+        )
+    for name, value in fields.items():
+        if value is None:
+            continue
+        if not value:
+            # Empty credentials are almost always an unset-env-var typo;
+            # reject so the caller finds out at our boundary, not via a
+            # cryptic auth/IAM failure later.
+            raise RedshiftIngestError(
+                f"{name} must be non-empty when provided"
+            )
+        _check_no_control_chars(name, value)
+        for ch in _CONN_STR_FORBIDDEN:
+            if ch in value:
+                raise RedshiftIngestError(
+                    f"{name} contains forbidden character {ch!r}"
+                )
+        if (
+            name in _SENSITIVE_CRED_FIELDS
+            and len(value) < _MIN_SECRET_REDACTION_LEN
+        ):
+            # ``_redact_secrets`` skips substrings shorter than
+            # ``_MIN_SECRET_REDACTION_LEN`` to avoid destroying error
+            # readability. Without a matching boundary reject, a caller
+            # with e.g. ``password="abc"`` (3 chars) would have their
+            # password slip through both the redaction helper (skipped)
+            # AND appear verbatim in any driver error that echoes the
+            # connection string. Reject at the boundary so the two
+            # thresholds stay coherent. Length, not entropy, is enforced
+            # here — entropy is a caller / IAM-policy concern.
+            raise RedshiftIngestError(
+                f"{name} must be at least {_MIN_SECRET_REDACTION_LEN} "
+                "characters; shorter values cannot be safely redacted "
+                "from driver error messages and would leak if the "
+                "connection string is echoed in an exception."
+            )
+
+
+def _validate_conn_string_identifier_fields(
+    *,
+    aws_profile: str | None,
+    aws_region: str | None,
+    cluster_id: str | None,
+    db_user: str | None,
+) -> None:
+    """Reject ``=`` and ASCII whitespace in identifier fields that interpolate
+    directly as ODBC ``KEY=<val>`` segments.
+
+    The universal ``_CONN_STR_FORBIDDEN`` list already blocks the
+    key-value terminators (``;{}\\0\\n\\r``), but a value containing
+    ``=`` or a space can still mis-parse inside the driver's
+    ``KEY=VALUE`` tokenizer — a malicious
+    ``aws_profile="x Region=elsewhere"`` or
+    ``db_user="foo=bar"`` could shadow a later key or smuggle a
+    second conn-string parameter. None of these four fields
+    legitimately contains ``=`` or whitespace: AWS profile names,
+    region strings, and cluster IDs use letters, digits, hyphens, and
+    underscores only; a Redshift ``db_user`` (unquoted at this
+    interpolation layer) uses letters, digits, ``_``, ``@``, ``#``,
+    ``$``. Rejecting ``=`` and whitespace has no false positives and
+    closes the KEY=VALUE-injection path.
+    """
+    forbidden = ("=", " ", "\t")
+    for name, value in (
+        ("aws_profile", aws_profile),
+        ("aws_region", aws_region),
+        ("cluster_id", cluster_id),
+        ("db_user", db_user),
+    ):
+        if value is None:
+            continue
+        for ch in forbidden:
+            if ch in value:
+                raise RedshiftIngestError(
+                    f"{name}={value!r} contains forbidden character "
+                    f"{ch!r}; conn-string identifier fields must not "
+                    "contain '=' or whitespace"
+                )
+
+
+def _validate_ssl_mode(ssl_mode: str | None) -> None:
+    # Type check already happened in the credential-string sweep; this
+    # only validates the whitelist membership.
+    if ssl_mode is not None and ssl_mode not in _SSL_MODES:
+        raise RedshiftIngestError(
+            f"ssl_mode={ssl_mode!r} not in whitelist; "
+            f"allowed: {sorted(_SSL_MODES)}"
+        )
+
+
+def _validate_parameters(
+    parameters: Sequence[str | None] | None,
+) -> list[str | None] | None:
+    if parameters is None:
+        return None
+    _check_list_or_tuple("parameters", parameters)
+    params = list(parameters)
+    for i, p in enumerate(params):
+        if p is not None and not isinstance(p, str):
+            raise RedshiftIngestError(
+                f"parameters[{i}] must be str or None, got "
+                f"{type(p).__name__}={p!r}. arrow_odbc binds ODBC "
+                "parameters as strings; convert numbers via str() at the "
+                "call site."
+            )
+    return params
+
+
+def _validate_expected_columns(
+    expected_columns: Sequence[str] | None,
+) -> list[str] | None:
+    if expected_columns is None:
+        return None
+    _check_list_or_tuple("expected_columns", expected_columns)
+    out = list(expected_columns)
+    for i, c in enumerate(out):
+        if not isinstance(c, str) or not c:
+            raise RedshiftIngestError(
+                f"expected_columns[{i}] must be non-empty str, got "
+                f"{type(c).__name__}={c!r}"
+            )
+    dupes = _find_duplicates(out)
+    if dupes:
+        raise RedshiftIngestError(
+            f"expected_columns contains duplicates: {dupes}"
+        )
+    return out
+
+
+def _validate_db_groups(
+    db_groups: Sequence[str] | None,
+    *,
+    iam: bool,
+) -> str | None:
+    """Return the comma-joined DbGroups value, or None to omit the key.
+
+    Each entry is bounds- and character-checked individually so a single
+    malformed group name surfaces a clear per-element error rather than an
+    opaque "DbGroups invalid" from the IAM API. Duplicates are rejected at
+    the boundary because Redshift silently dedupes them, which would
+    otherwise hide a copy-paste bug at the call site.
+
+    Also enforces the cross-field rule that ``db_groups`` requires
+    ``iam=True`` (groups are assigned by ``GetClusterCredentials``).
+    """
+    if db_groups is None:
+        return None
+    _check_list_or_tuple("db_groups", db_groups)
+    groups = list(db_groups)
+    if not groups:
+        # An empty list is almost always a config bug (e.g. an unset
+        # env var split into ``""``-then-``split(",")``-into-``[""]``-
+        # then-filtered-empty, or a YAML ``db_groups: []`` that the
+        # caller meant to populate). Silently degrading to "no
+        # DbGroups key emitted" would also bypass the iam=True
+        # cross-field check below, letting a half-migrated call site
+        # ship without IAM. Reject explicitly so the caller fixes
+        # the source — pass None to omit DbGroups deliberately.
+        raise RedshiftIngestError(
+            "db_groups was provided as an empty list/tuple; pass "
+            "None to omit DbGroups (server will use the user's "
+            "default groups), or supply at least one group name. "
+            "An empty sequence is rejected because it is almost "
+            "always a config bug and would also silently bypass "
+            "the iam=True cross-field requirement."
+        )
+    if len(groups) > _MAX_DB_GROUPS:
+        raise RedshiftIngestError(
+            f"db_groups has {len(groups)} entries, exceeds cap "
+            f"{_MAX_DB_GROUPS}"
+        )
+    for i, g in enumerate(groups):
+        if not isinstance(g, str) or not g:
+            raise RedshiftIngestError(
+                f"db_groups[{i}] must be non-empty str, got "
+                f"{type(g).__name__}={g!r}"
+            )
+        for ch in _DB_GROUP_FORBIDDEN:
+            if ch in g:
+                raise RedshiftIngestError(
+                    f"db_groups[{i}]={g!r} contains forbidden character "
+                    f"{ch!r}"
+                )
+    dupes = _find_duplicates(groups)
+    if dupes:
+        raise RedshiftIngestError(
+            f"db_groups contains duplicates: {dupes}"
+        )
+    if not iam:
+        raise RedshiftIngestError(
+            "db_groups requires iam=True (groups are assigned by "
+            "GetClusterCredentials)"
+        )
+    return ",".join(groups)
+
+
+def _validate_iam_auth(
+    *,
+    iam: bool,
+    user: str | None,
+    password: str | None,
+    aws_profile: str | None,
+    aws_access_key_id: str | None,
+    aws_secret_access_key: str | None,
+    aws_session_token: str | None,
+    aws_region: str | None,
+    cluster_id: str | None,
+    db_user: str | None,
+    auto_create: bool,
+) -> None:
+    """Cross-field validation for native vs IAM auth.
+
+    Native (iam=False): UID/PWD only — reject every IAM-only field so that
+    a half-migrated call site (e.g. forgot to flip ``iam=True`` after
+    adding ``db_user``) fails loudly instead of silently logging in as a
+    Redshift native user with the IAM fields ignored.
+
+    IAM (iam=True): one credential source only (profile XOR explicit keys
+    XOR default credential chain), plus a ``db_user`` that
+    ``GetClusterCredentials`` will mint a temp password for. Reject native
+    UID/PWD because the temp password from the IAM API is what the driver
+    will actually send — passing UID/PWD here is a misconfiguration that
+    fails server-side with an opaque "auth failed" message.
+    """
+    iam_only_fields = {
+        "aws_profile": aws_profile,
+        "aws_access_key_id": aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_session_token": aws_session_token,
+        "aws_region": aws_region,
+        "cluster_id": cluster_id,
+        "db_user": db_user,
+    }
+    if not iam:
+        leaked = [k for k, v in iam_only_fields.items() if v is not None]
+        if auto_create:
+            leaked.append("auto_create")
+        if leaked:
+            raise RedshiftIngestError(
+                f"iam=False but IAM-only field(s) supplied: {sorted(leaked)}. "
+                "Set iam=True to use IAM federated auth, or remove these."
+            )
+        if user is None or password is None:
+            raise RedshiftIngestError(
+                "iam=False requires both user and password (Redshift "
+                "native auth)"
+            )
+        return
+
+    # iam=True
+    if user is not None or password is not None:
+        raise RedshiftIngestError(
+            "iam=True must not be combined with user/password; the "
+            "Amazon Redshift ODBC driver mints a temp password via "
+            "GetClusterCredentials. Pass db_user instead."
+        )
+    if db_user is None:
+        raise RedshiftIngestError(
+            "iam=True requires db_user (the Redshift database user that "
+            "GetClusterCredentials will issue a temporary password for)"
+        )
+    explicit_keys = (
+        aws_access_key_id is not None
+        or aws_secret_access_key is not None
+        or aws_session_token is not None
+    )
+    if aws_profile is not None and explicit_keys:
+        raise RedshiftIngestError(
+            "iam=True: aws_profile and explicit AWS keys are mutually "
+            "exclusive credential sources; pick one"
+        )
+    if aws_access_key_id is not None and aws_secret_access_key is None:
+        raise RedshiftIngestError(
+            "iam=True: aws_access_key_id requires aws_secret_access_key"
+        )
+    if aws_secret_access_key is not None and aws_access_key_id is None:
+        raise RedshiftIngestError(
+            "iam=True: aws_secret_access_key requires aws_access_key_id"
+        )
+    if aws_session_token is not None and aws_access_key_id is None:
+        raise RedshiftIngestError(
+            "iam=True: aws_session_token must accompany "
+            "aws_access_key_id+aws_secret_access_key (temporary STS creds)"
+        )
+
+
+# =============================================================================
+# Connection-string composition
+# =============================================================================
+
+
+def _endpoint_segment(
+    *, driver: str, host: str, port: int, database: str
+) -> list[str]:
+    return [
+        f"DRIVER={{{driver}}}",
+        f"SERVER={host}",
+        f"PORT={port}",
+        f"DATABASE={database}",
+    ]
+
+
+def _native_auth_segment(*, user: str, password: str) -> list[str]:
+    return [f"UID={user}", f"PWD={password}"]
+
+
+def _iam_auth_segment(
+    *,
+    db_user: str,
+    db_groups_value: str | None,
+    auto_create: bool,
+    cluster_id: str | None,
+    aws_region: str | None,
+    aws_profile: str | None,
+    aws_access_key_id: str | None,
+    aws_secret_access_key: str | None,
+    aws_session_token: str | None,
+) -> list[str]:
+    """Build the IAM-mode connection-string segment.
+
+    Every value here was character-checked by
+    ``_validate_optional_credential_strings`` and the credential-source
+    XOR was enforced by ``_validate_iam_auth``; interpolation is safe.
+    """
+    parts: list[str] = ["IAM=1", f"DbUser={db_user}"]
+    if db_groups_value is not None:
+        parts.append(f"DbGroups={db_groups_value}")
+    if auto_create:
+        parts.append("AutoCreate=1")
+    if cluster_id is not None:
+        parts.append(f"ClusterID={cluster_id}")
+    if aws_region is not None:
+        parts.append(f"Region={aws_region}")
+    if aws_profile is not None:
+        parts.append(f"Profile={aws_profile}")
+    if aws_access_key_id is not None:
+        # _validate_iam_auth enforced secret-key + (optional) session-token
+        # come together with the access key id. Use an explicit raise
+        # rather than ``assert`` so the guard survives ``python -O``;
+        # without it, an upstream refactor that breaks the pairing
+        # would silently ship ``SecretAccessKey=None`` to the driver.
+        if aws_secret_access_key is None:
+            raise RedshiftIngestError(
+                "invariant violated: aws_access_key_id is set but "
+                "aws_secret_access_key is None; _validate_iam_auth "
+                "should have enforced this pairing"
+            )
+        parts.append(f"AccessKeyID={aws_access_key_id}")
+        parts.append(f"SecretAccessKey={aws_secret_access_key}")
+        if aws_session_token is not None:
+            parts.append(f"SessionToken={aws_session_token}")
+    return parts
+
+
+def _build_connection_string(
+    *,
+    driver: str,
+    host: str,
+    port: int,
+    database: str,
+    iam: bool,
+    user: str | None,
+    password: str | None,
+    db_user: str | None,
+    db_groups_value: str | None,
+    auto_create: bool,
+    cluster_id: str | None,
+    aws_region: str | None,
+    aws_profile: str | None,
+    aws_access_key_id: str | None,
+    aws_secret_access_key: str | None,
+    aws_session_token: str | None,
+    ssl_mode: str | None,
+) -> str:
+    parts = _endpoint_segment(
+        driver=driver, host=host, port=port, database=database
+    )
+    if iam:
+        # _validate_iam_auth narrowed db_user to non-None for the IAM
+        # branch; restate the invariant with an explicit raise rather
+        # than ``assert`` so ``python -O`` cannot strip the guard.
+        # Without this, a broken upstream refactor would ship
+        # ``DbUser=None`` literally in the connection string.
+        if db_user is None:
+            raise RedshiftIngestError(
+                "invariant violated: iam=True but db_user is None; "
+                "_validate_iam_auth should have enforced this"
+            )
+        parts.extend(
+            _iam_auth_segment(
+                db_user=db_user,
+                db_groups_value=db_groups_value,
+                auto_create=auto_create,
+                cluster_id=cluster_id,
+                aws_region=aws_region,
+                aws_profile=aws_profile,
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                aws_session_token=aws_session_token,
+            )
+        )
+    else:
+        # _validate_iam_auth narrowed user/password to non-None for the
+        # native branch. Explicit raise (not ``assert``) so ``python -O``
+        # cannot strip the guard and ship ``UID=None;PWD=None`` to the
+        # driver.
+        if user is None or password is None:
+            raise RedshiftIngestError(
+                "invariant violated: iam=False but user or password is "
+                "None; _validate_iam_auth should have enforced this"
+            )
+        parts.extend(_native_auth_segment(user=user, password=password))
+    if ssl_mode is not None:
+        parts.append(f"SSLMode={ssl_mode}")
+    return ";".join(parts) + ";"
+
+
+# =============================================================================
+# arrow_odbc reader: open, schema, stream
+# =============================================================================
+
+
+def _open_arrow_reader(
+    *,
+    conn_str: str,
+    query: str,
+    parameters: list[str | None] | None,
+    batch_size: int,
+    login_timeout_sec: int,
+    query_timeout_sec: int | None,
+    max_text_size: int | None,
+    max_binary_size: int | None,
+    user: str | None,
+    password: str | None,
+    iam: bool,
+    host: str,
+    database: str,
+    secrets: tuple[str, ...],
+) -> _ArrowBatchReader:
+    """Open the streaming reader; never returns None.
+
+    When ``iam=True`` we deliberately DON'T forward ``user``/``password``
+    to ``arrow_odbc``: the IAM path mints them via
+    ``GetClusterCredentials``, and forwarding empty strings would
+    override the temp creds with bogus ones.
+
+    ``secrets`` are substrings stripped from any exception message
+    propagated up from ``arrow_odbc`` / the underlying ODBC driver, in
+    case the driver echoes the full connection string in its error
+    text. We also swap ``raise ... from exc`` for ``raise ... from
+    None`` so the original exception's (unredacted) message does not
+    appear in the default traceback.
+    """
+    # ``try / finally`` wraps the entire body so the cred-bearing
+    # locals (``conn_str``, ``password``, ``odbc_password``) are cleared
+    # on EVERY exit — success, Exception, BaseException — before any
+    # traceback propagates out of this frame. Frame-locals is a
+    # separate info-leak surface from the exception message
+    # (``sentry_sdk with_locals=True``, ``cgitb``, ``rich``'s
+    # traceback, ``logging`` handlers that dump ``__traceback__`` all
+    # read ``frame.f_locals`` at capture time); ``_redact_secrets``
+    # sanitizes only the message text. By the time ``finally`` runs,
+    # the ODBC driver has internalized ``conn_str`` / ``password``
+    # inside the reader's Rust state, so rebinding our locals is safe.
+    try:
+        odbc_user = None if iam else user
+        odbc_password = None if iam else password
+        try:
+            reader = read_arrow_batches_from_odbc(
+                connection_string=conn_str,
+                query=query,
+                batch_size=batch_size,
+                user=odbc_user,
+                password=odbc_password,
+                parameters=parameters,
+                login_timeout_sec=login_timeout_sec,
+                query_timeout_sec=query_timeout_sec,
+                max_text_size=max_text_size,
+                max_binary_size=max_binary_size,
+            )
+        except TypeError as exc:
+            # arrow_odbc added max_text_size / max_binary_size /
+            # query_timeout_sec in different releases; an "unexpected
+            # keyword argument" here almost certainly means the
+            # installed arrow_odbc is older than this wrapper expects.
+            raise RedshiftIngestError(
+                f"arrow_odbc rejected a keyword argument "
+                f"(likely a version mismatch): "
+                f"{_redact_secrets(str(exc), secrets)}"
+            ) from None
+        except Exception as exc:  # arrow_odbc raises a variety of native errors
+            raise RedshiftIngestError(
+                f"failed to open ODBC reader against {host}/{database}: "
+                f"{_redact_secrets(str(exc), secrets)}"
+            ) from None
+
+        if reader is None:
+            # arrow_odbc returns None for statements with no result set
+            # (INSERT/UPDATE/DDL/COPY). redshift_query is defined only
+            # for SELECT.
+            raise RedshiftIngestError(
+                "query produced no result set; redshift_query expects "
+                "a SELECT"
+            )
+        # ``_ArrowBatchReader`` is a structural Protocol; mypy trusts
+        # the ``cast`` without a runtime check. Explicitly verify
+        # conformance here so a non-conforming return (arrow_odbc
+        # version drift, a mocked reader in tests, a misconfigured
+        # driver) surfaces as a clear ``RedshiftIngestError`` rather
+        # than as a downstream ``AttributeError`` inside
+        # ``_read_arrow_schema`` or ``_stream_batches`` wrapped with a
+        # misleading "failed to read schema" / "failed while streaming"
+        # message.
+        if not hasattr(reader, "schema") or not hasattr(reader, "__iter__"):
+            raise RedshiftIngestError(
+                "arrow_odbc returned a non-conforming reader "
+                f"({type(reader).__name__}): expected an object with "
+                "``.schema`` and ``__iter__``. This is usually an "
+                "arrow_odbc version drift or a test-stub that does "
+                "not implement the BatchReader surface."
+            )
+        # arrow_odbc is untyped; mypy sees ``reader`` as ``Any``. Cast
+        # at this single bridge point so downstream helpers get a
+        # precise static type (see ``_ArrowBatchReader``) without
+        # ``type: ignore`` sprinkled through the module.
+        return cast("_ArrowBatchReader", reader)
+    finally:
+        # Scrub every cred-bearing and identifier local on the helper
+        # frame. ``odbc_user`` is not secret but is rebound for
+        # symmetry with the other locals — a frame-locals dumper
+        # otherwise sees a half-cleaned frame, which muddies incident
+        # forensics.
+        #
+        # ``query`` / ``parameters`` are also scrubbed: the caller may
+        # have embedded sensitive literals or bound a customer-id /
+        # account-number parameter, and the driver has internalized
+        # both values by the time we exit. ``secrets`` is rebound for
+        # the same reason as the outer caller's ``secrets = ()`` clear
+        # — frame-locals dumpers walk every frame in the traceback,
+        # not just the outermost, so leaving the credential tuple
+        # bound on this helper's frame would re-expose what the outer
+        # ``redshift_query`` finally already scrubbed.
+        conn_str = ""  # noqa: F841
+        password = None  # noqa: F841
+        odbc_user = None  # noqa: F841
+        odbc_password = None  # noqa: F841
+        query = ""  # noqa: F841
+        parameters = None  # noqa: F841
+        secrets = ()  # noqa: F841
+
+
+def _read_arrow_schema(
+    reader: _ArrowBatchReader, *, secrets: tuple[str, ...]
+) -> pa.Schema:
+    # ``try / finally: del reader`` releases this frame's reference on
+    # every exit path — success, ``Exception``, AND ``BaseException``
+    # (``KeyboardInterrupt`` / ``SystemExit``) — so the traceback frame
+    # that Python captures for the propagating exception cannot pin the
+    # ODBC cursor open via its locals dict. The caller still holds its
+    # own reference to ``reader``; dropping ours is always safe, and
+    # lets the outer ``redshift_query`` ``finally: del reader`` close
+    # the cursor promptly without waiting for traceback GC.
+    #
+    # ``secrets`` is rebound to ``()`` in the same finally so the
+    # helper's frame does not retain the credential tuple — frame
+    # locals are walked by sentry/cgitb/rich on every frame in the
+    # traceback, not just the outermost, so the outer caller's
+    # ``secrets = ()`` clear would otherwise be undermined by this
+    # frame's bound parameter. The redact call above runs strictly
+    # before the finally fires, so redaction of the original error
+    # message is unaffected.
+    try:
+        try:
+            schema = reader.schema
+        except Exception as exc:
+            redacted = _redact_secrets(str(exc), secrets)
+            raise RedshiftIngestError(
+                f"failed to read arrow schema from ODBC result: {redacted}"
+            ) from None
+    finally:
+        del reader
+        secrets = ()  # noqa: F841
+    if schema is None:
+        raise RedshiftIngestError("ODBC result reported a null arrow schema")
+    return schema
+
+
+def _check_schema_no_duplicates(schema: pa.Schema) -> list[str]:
+    """Return the schema's column names, asserting no duplicates.
+
+    Done pre-conversion so duplicate field names surface as a clear
+    boundary error rather than an opaque ``ComputeError`` from
+    ``pl.from_arrow``. The ``list(schema.names)`` call is wrapped so
+    that any ``AttributeError`` / ``TypeError`` from a non-conforming
+    schema-like object (async driver stubs, mocked tests) still surfaces
+    as ``RedshiftIngestError`` per the wrapper's "all failures surface
+    as ``RedshiftIngestError``" contract.
+    """
+    try:
+        names: list[str] = list(schema.names)
+    except Exception as exc:
+        raise RedshiftIngestError(
+            f"failed to read arrow schema field names: "
+            f"{type(exc).__name__}: {exc}"
+        ) from None
+    dupes = _find_duplicates(names)
+    if dupes:
+        raise RedshiftIngestError(
+            f"duplicate column names in server result set: {dupes}"
+        )
+    return names
+
+
+def _stream_batches(
+    reader: _ArrowBatchReader,
+    *,
+    max_rows: int | None,
+    host: str,
+    database: str,
+    secrets: tuple[str, ...],
+) -> tuple[list[pa.RecordBatch], int]:
+    """Drain ``reader`` into a list of batches, aborting at ``max_rows``.
+
+    Manual iteration (vs ``list(reader)``) so ``max_rows`` can abort early
+    before we balloon memory on a runaway result. At most one extra
+    ``batch_size`` chunk is buffered beyond the cap before memory is
+    released.
+
+    ``secrets`` are redacted from any propagated driver error (see
+    ``_open_arrow_reader``); mid-stream errors rarely carry the conn
+    string, but the same discipline is applied for defense in depth.
+    """
+    batches: list[pa.RecordBatch] = []
+    total_rows = 0
+    over_cap = False
+    # ``try / finally: del reader`` releases this frame's reference on
+    # every exit path — success, ``Exception``, AND ``BaseException``
+    # (``KeyboardInterrupt`` / ``SystemExit``) — so the traceback frame
+    # captured by any propagating exception cannot pin the ODBC cursor
+    # open via its locals dict. The caller still holds its own
+    # reference; dropping ours only removes the helper-frame pin.
+    try:
+        try:
+            for batch in reader:
+                batches.append(batch)
+                total_rows += batch.num_rows
+                if max_rows is not None and total_rows > max_rows:
+                    over_cap = True
+                    break
+        except Exception as exc:
+            batches.clear()
+            redacted = _redact_secrets(str(exc), secrets)
+            raise RedshiftIngestError(
+                f"failed while streaming batches from {host}/{database}: "
+                f"{redacted}"
+            ) from None
+        except BaseException:
+            # On KeyboardInterrupt / SystemExit mid-stream, a partial
+            # ``batches`` list (potentially GB-sized if iteration was
+            # deep into a large result) would otherwise stay pinned in
+            # this frame's locals via the propagating traceback. Free
+            # it before the interrupt propagates; the outer
+            # ``finally: del reader`` still handles the cursor close.
+            batches.clear()
+            raise
+    finally:
+        del reader
+        # See ``_read_arrow_schema``: scrub the helper-frame's
+        # credential tuple so frame-locals dumpers walking every frame
+        # in the traceback don't undo the outer ``secrets = ()`` clear.
+        # Redaction in the except block above runs strictly before
+        # this finally, so the error message is unaffected.
+        secrets = ()  # noqa: F841
+
+    if over_cap:
+        # ``over_cap = True`` is only set inside the loop after the
+        # ``max_rows is not None`` guard; narrow for the type checker
+        # with an explicit raise rather than ``assert`` so ``python -O``
+        # cannot strip the invariant. Clear batches FIRST on every
+        # raise path so the (possibly large) partial list doesn't stay
+        # pinned in this frame's locals via the propagating traceback.
+        batches.clear()
+        if max_rows is None:
+            raise RedshiftIngestError(
+                "invariant violated: over_cap=True but max_rows is None"
+            )
+        raise RedshiftIngestError(
+            f"result exceeded max_rows={max_rows}: streamed "
+            f"{total_rows} rows before abort against {host}/{database}"
+        )
+    return batches, total_rows
+
+
+# =============================================================================
+# Arrow -> Polars conversion + invariants
+# =============================================================================
+
+
+def _assemble_arrow_table(
+    batches: list[pa.RecordBatch],
+    schema: pa.Schema,
+    expected_rows: int,
+) -> pa.Table:
+    try:
+        table = pa.Table.from_batches(batches=batches, schema=schema)
+    except Exception as exc:
+        # Release the accumulated batches before propagating; the Table
+        # wasn't built, so they'd otherwise linger until GC.
+        batches.clear()
+        raise RedshiftIngestError(
+            f"failed to assemble arrow table: {exc}"
+        ) from exc
+    if table.num_rows != expected_rows:
+        # Clear batches BEFORE the invariant raise: otherwise the
+        # (potentially GB-sized) list stays pinned in this frame's
+        # locals via the propagating traceback. ``table`` also holds
+        # the data zero-copy, but the caller needs ``table`` to have a
+        # chance at recovery; the intermediate batches are redundant.
+        batches.clear()
+        raise RedshiftIngestError(
+            "row-count invariant violated assembling arrow Table: "
+            f"sum(batch.num_rows)={expected_rows} vs table.num_rows="
+            f"{table.num_rows}"
+        )
+    # Release per-batch Python refs. The Table keeps its own zero-copy
+    # references to the underlying buffers.
+    batches.clear()
+    return table
+
+
+def _arrow_table_to_polars(
+    table: pa.Table,
+    *,
+    schema_names: list[str],
+    expected_rows: int,
+) -> pl.DataFrame:
+    """Convert and assert column-order, row-count, and no-dupe invariants.
+
+    ``pl.from_arrow(Table)`` returns ``DataFrame``; the ``Series`` branch
+    exists for ``Array``/``ChunkedArray`` inputs. Wrap defensively:
+    recent Polars rejects tables with duplicate arrow field names, which
+    we'd rather surface as ``RedshiftIngestError`` than as a raw
+    ``pl.exceptions`` error.
+    """
+    try:
+        df_or_series = pl.from_arrow(table)
+    except Exception as exc:
+        raise RedshiftIngestError(
+            f"failed to convert arrow Table to Polars DataFrame: {exc}"
+        ) from exc
+    if not isinstance(df_or_series, pl.DataFrame):
+        raise RedshiftIngestError(
+            f"expected pl.DataFrame from arrow Table, got "
+            f"{type(df_or_series).__name__}"
+        )
+    df = df_or_series
+
+    cols = list(df.columns)
+    if cols != schema_names:
+        raise RedshiftIngestError(
+            "schema mismatch between arrow Table and Polars DataFrame "
+            f"(arrow={schema_names} polars={cols}); "
+            "pl.from_arrow must not reorder or rename columns"
+        )
+    if df.height != expected_rows:
+        raise RedshiftIngestError(
+            "row-count invariant violated in arrow->polars conversion: "
+            f"expected {expected_rows}, got {df.height}"
+        )
+    cols_dupes = _find_duplicates(cols)
+    if cols_dupes:
+        # Unreachable given the pre-conversion schema check, but kept as
+        # a defense-in-depth guard against future arrow/polars behavior
+        # drift.
+        raise RedshiftIngestError(
+            f"duplicate column names in result set: {cols_dupes}"
+        )
+    return df
+
+
+# =============================================================================
+# Caller-facing post-load contract checks
+# =============================================================================
+
+
+def _check_expected_columns(
+    df: pl.DataFrame,
+    expected: list[str] | None,
+    *,
+    allow_extra_columns: bool,
+) -> None:
+    if expected is None:
+        return
+    cols = list(df.columns)
+    missing = [c for c in expected if c not in cols]
+    extra = [c for c in cols if c not in expected]
+    if missing or (extra and not allow_extra_columns):
+        err_msg = f"schema mismatch: missing={missing}"
+        if not allow_extra_columns:
+            err_msg += f" extra={extra}"
+        err_msg += f" got={cols}"
+        raise RedshiftIngestError(err_msg)
+
+
+def _has_naive_datetime(dtype: pl.DataType) -> bool:
+    """Recursively check a polars dtype for a naive ``Datetime`` leaf.
+
+    Redshift SUPER projected via some arrow_odbc / ODBC-driver combos
+    lands as ``pl.Struct({...})`` / ``pl.List(...)`` / ``pl.Array(...)``
+    rather than a flat VARCHAR. A top-level-only check would let a
+    naive inner Datetime slip past ``require_tz_aware_timestamps`` and
+    violate the inbound contract.
+
+    Access to ``inner`` / ``fields`` is wrapped in broad ``except
+    Exception`` rather than a plain ``getattr(..., None)`` because on
+    some polars versions these are implemented as properties whose
+    getter can itself raise (missing-argument errors on unparameterized
+    class references, API drift, etc.); ``getattr`` does NOT suppress
+    exceptions raised inside the descriptor, only ``AttributeError``
+    from a missing attribute. Swallowing here degrades to "top-level
+    isinstance result governs," which matches the older-polars
+    fall-through behavior.
+    """
+    if isinstance(dtype, pl.Datetime):
+        return _datetime_tz(dtype) is None
+    try:
+        inner = getattr(dtype, "inner", None)
+    except Exception:
+        inner = None
+    if isinstance(inner, pl.DataType) and _has_naive_datetime(inner):
+        return True
+    try:
+        fields = getattr(dtype, "fields", None)
+    except Exception:
+        fields = None
+    if fields is not None:
+        try:
+            for f in fields:
+                try:
+                    f_dtype = getattr(f, "dtype", None)
+                except Exception:
+                    f_dtype = None
+                if isinstance(f_dtype, pl.DataType) and _has_naive_datetime(
+                    f_dtype
+                ):
+                    return True
+        except TypeError:
+            # ``fields`` not iterable on this polars version; fall
+            # through. The top-level isinstance result governs.
+            pass
+    return False
+
+
+def _check_tz_aware_timestamps(
+    df: pl.DataFrame, *, require: bool
+) -> None:
+    if not require:
+        return
+    # Recurse into nested types so naive ``pl.Datetime`` inside
+    # ``pl.Struct`` / ``pl.List`` / ``pl.Array`` (reachable via Redshift
+    # SUPER projection on recent driver combos) is flagged, not just
+    # top-level columns.
+    naive = [
+        name
+        for name, dtype in df.schema.items()
+        if _has_naive_datetime(dtype)
+    ]
+    if naive:
+        raise RedshiftIngestError(
+            f"require_tz_aware_timestamps=True but columns contain "
+            f"naive Datetime (top-level or nested in Struct/List/"
+            f"Array): {naive}"
+        )
+
+
+def _check_non_empty(
+    df: pl.DataFrame, *, require: bool, host: str, database: str
+) -> None:
+    if require and df.height == 0:
+        raise RedshiftIngestError(
+            f"query returned 0 rows against {host}/{database} "
+            "(require_non_empty=True)"
+        )
+
+
+def _check_finite_numerics(
+    df: pl.DataFrame, *, require: bool
+) -> None:
+    """Reject NULL / NaN / ±Inf in numeric columns when ``require=True``.
+
+    Implements CLAUDE.md inbound boundary contract item 4
+    "Finiteness". For Int/UInt/Decimal columns we reject only NULL
+    (those types cannot represent NaN/Inf). For Float32/Float64 we
+    additionally reject NaN / +Inf / -Inf via ``is_finite``. Defaults
+    off because Redshift NULL columns are a documented expectation per
+    CLAUDE.md ("except where NaN is documented as expected"); enable
+    explicitly for tables where NULL/NaN indicates upstream corruption
+    (e.g. mid-day-snapshot pricing where every row should be filled).
+
+    Polars-call exceptions are wrapped to ``RedshiftIngestError`` to
+    keep the wrapper's "all failures surface as ``RedshiftIngestError``"
+    contract intact, even on dtype-API drift across polars releases.
+    The loop does NOT abort on the first polars-side exception: data
+    violations on other columns are still collected and surfaced, with
+    the API-error column listed alongside. CLAUDE.md inbound rule is
+    "fail loud with a message naming the offending column"; that's
+    served best by reporting all bad columns at once, not the first
+    one we tripped over.
+    """
+    if not require:
+        return
+    bad: list[str] = []
+    api_errors: list[tuple[str, Exception]] = []
+    for name, dtype in df.schema.items():
+        if not isinstance(dtype, _NUMERIC_DTYPE_CLASSES):
+            continue
+        try:
+            if df[name].null_count() > 0:
+                bad.append(name)
+                continue
+            if isinstance(dtype, _FLOAT_DTYPE_CLASSES):
+                # ``is_finite`` returns False for NaN / +Inf / -Inf.
+                # On an empty Series ``.all()`` returns True (vacuous),
+                # which is the correct semantics — nothing to violate.
+                if not bool(df[name].is_finite().all()):
+                    bad.append(name)
+        except Exception as exc:  # noqa: BLE001
+            # Polars dtype-API drift on this column; capture and keep
+            # checking the rest so the operator sees every problem at
+            # once. Report-style chosen below.
+            api_errors.append((name, exc))
+    if bad:
+        msg = (
+            "require_finite_numerics=True but numeric columns contain "
+            f"NULL / NaN / Inf: {bad}"
+        )
+        if api_errors:
+            err_cols = [n for n, _ in api_errors]
+            msg += (
+                " (additionally, the check could not be evaluated on "
+                f"columns: {err_cols})"
+            )
+        raise RedshiftIngestError(msg)
+    if api_errors:
+        # Variable is named ``api_err`` (not ``exc``) because Python 3
+        # implicitly ``del exc`` at the end of an ``except ... as exc``
+        # block (PEP 3134), and re-binding the same name outside the
+        # except confuses mypy under ``--strict`` (see
+        # ``[misc]`` "Assignment to variable ... outside except: block").
+        bad_name, api_err = api_errors[0]
+        # ``from api_err`` matches the discipline of the other
+        # post-reader helpers (``_assemble_arrow_table`` /
+        # ``_arrow_table_to_polars``): at this stage there are no
+        # credentials in scope, and the original polars exception text
+        # is debug-useful (which dtype API was missing) without leaking
+        # secrets.
+        raise RedshiftIngestError(
+            f"finiteness check failed on column {bad_name!r}: "
+            f"{type(api_err).__name__}: {api_err}"
+        ) from api_err
+
+
+# =============================================================================
+# Public entry point
+# =============================================================================
+
+
+def redshift_query(
+    host: str,
+    database: str,
+    query: str,
+    *,
+    parameters: Sequence[str | None] | None = None,
+    driver: str = "Amazon Redshift (x64)",
+    port: int = 5439,
+    user: str | None = None,
+    password: str | None = None,
+    batch_size: int = 100_000,
+    login_timeout_sec: int = 30,
+    query_timeout_sec: int | None = None,
+    max_rows: int | None = None,
+    max_text_size: int | None = None,
+    max_binary_size: int | None = None,
+    ssl_mode: str | None = None,
+    iam: bool = False,
+    aws_profile: str | None = None,
+    aws_access_key_id: str | None = None,
+    aws_secret_access_key: str | None = None,
+    aws_session_token: str | None = None,
+    aws_region: str | None = None,
+    cluster_id: str | None = None,
+    db_user: str | None = None,
+    db_groups: Sequence[str] | None = None,
+    auto_create: bool = False,
+    expected_columns: Sequence[str] | None = None,
+    allow_extra_columns: bool = False,
+    require_non_empty: bool = False,
+    require_tz_aware_timestamps: bool = False,
+    require_finite_numerics: bool = False,
+) -> pl.DataFrame:
+    """Run a SELECT against Amazon Redshift and return a Polars DataFrame.
+
+    Parameters are bound via ODBC (``parameters``), never via string
+    formatting, so callers should always prefer ``?`` placeholders over
+    f-strings in ``query``. All failures surface as ``RedshiftIngestError``.
+
+    Memory: the full result set is materialized in memory. For multi-GB
+    queries, shrink the server-side projection or filter before calling,
+    or pass ``max_rows`` to abort early.
+
+    ``max_rows`` (opt-in): caps how many rows the stream is allowed to
+    accumulate before we abort with ``RedshiftIngestError``. The abort
+    fires during streaming, so at most one extra ``batch_size`` chunk of
+    rows is buffered beyond the cap before memory is released.
+
+    ``max_text_size`` / ``max_binary_size`` (opt-in, bytes): forwarded to
+    ``arrow_odbc`` to size the buffers it allocates for unbounded SQL
+    types. Redshift's max ``VARCHAR`` length is 65535 bytes (no MAX
+    type), but stored procedures and SUPER->VARCHAR projections can
+    return wider rows than the driver's default buffer; if your SELECT
+    returns large text columns, set these explicitly.
+
+    ``ssl_mode`` (opt-in): emitted as ``SSLMode=<value>`` when not
+    ``None``. Whitelist: ``verify-full``, ``verify-ca`` (driver default),
+    ``require``, ``prefer``, ``disable``. Redshift clusters always speak
+    TLS, so ``disable`` is rejected by most cluster configurations and
+    is included only for parity with the driver's documented values.
+    Use ``verify-full`` (CA + hostname) for production.
+
+    Authentication modes:
+
+      * **Native** (``iam=False``, the default): supply ``user`` +
+        ``password`` for a Redshift database user. All IAM-only fields
+        must be ``None``.
+
+      * **IAM federated** (``iam=True``): the driver calls
+        ``redshift:GetClusterCredentials`` to mint a temporary password
+        for ``db_user`` (required). Pick exactly one credential source:
+
+          - ``aws_profile``: read AWS creds from the named profile in
+            ``~/.aws/credentials`` / ``~/.aws/config``.
+          - ``aws_access_key_id`` + ``aws_secret_access_key``
+            (+ optional ``aws_session_token`` for temporary STS creds):
+            explicit creds.
+          - Neither set: fall back to the AWS default credential chain
+            (env vars ``AWS_ACCESS_KEY_ID`` etc., EC2 instance role,
+            ECS task role, IMDSv2). Intended for code running inside
+            AWS with a role attached.
+
+        ``db_groups`` (optional): the IAM-issued temp user joins these
+        Redshift groups for the session. Names are validated and
+        comma-joined into the connection string.
+
+        ``auto_create=True``: if ``db_user`` doesn't exist in Redshift,
+        create it on first login. Off by default — enabling silently
+        creates database principals, which most production roles
+        prohibit.
+
+        ``cluster_id`` + ``aws_region``: required when the driver cannot
+        infer them from ``host`` (i.e. when ``host`` is a custom CNAME
+        rather than the standard cluster endpoint). Safe to omit when
+        ``host`` is the canonical
+        ``<cluster>.<id>.<region>.redshift.amazonaws.com`` endpoint —
+        the driver parses cluster id and region from the hostname.
+
+    IdP plugins (Okta, Azure AD, AD FS, JWT, BrowserAzureAD, etc.) are
+    NOT supported by this wrapper. They each require their own subset
+    of ``plugin_name``-specific connection keys; adding them here would
+    bloat the surface and the validation matrix. If you need an IdP
+    plugin, build the connection string at the call site and call
+    ``arrow_odbc.read_arrow_batches_from_odbc`` directly.
+
+    Cross-platform:
+      * Driver name differs by platform / installer:
+          - Windows: ``"Amazon Redshift (x64)"`` (the default here),
+            installed via the ``AmazonRedshiftODBC64`` MSI.
+          - Linux: typically ``"Amazon Redshift ODBC Driver"`` as
+            registered in ``/etc/odbcinst.ini`` by the RPM/DEB
+            package; pass it explicitly via ``driver=``.
+          - macOS: install + register via unixODBC (NOT iODBC, which
+            macOS ships by default and which is not supported).
+      * Driver manager: Windows uses the built-in ODBC Driver Manager
+        (case-INSENSITIVE driver lookup); Linux/macOS use ``unixODBC``
+        (case-SENSITIVE — match the ``[Amazon Redshift ODBC Driver]``
+        section header in ``odbcinst.ini`` exactly).
+
+    Multiple result sets: Redshift's wire protocol returns one result
+    per statement, but a multi-statement ``query`` (e.g. ``SET ...; SELECT
+    ...``) only surfaces the FIRST result set through ``arrow_odbc`` —
+    subsequent ones are silently dropped. Run session ``SET`` separately
+    or fold them into a single SELECT.
+
+    Set ``require_tz_aware_timestamps=True`` to enforce the CLAUDE.md
+    inbound contract that every Datetime column carries a timezone.
+    Redshift's ``TIMESTAMP`` is naive (no zone) and ``TIMESTAMPTZ`` is
+    UTC-aware; cast naive columns to ``TIMESTAMPTZ`` server-side (e.g.
+    ``ts AT TIME ZONE 'UTC'``) before querying with this flag set.
+    The check recurses through ``pl.Struct`` / ``pl.List`` / ``pl.Array``
+    (Redshift SUPER projections can land as nested arrow types on some
+    driver builds), so a naive Datetime nested inside a struct is also
+    flagged.
+
+    Set ``require_finite_numerics=True`` to enforce the CLAUDE.md
+    inbound contract item 4 ("Finiteness"). Every numeric column —
+    ``Int*`` / ``UInt*`` / ``Decimal`` / ``Float32`` / ``Float64`` —
+    must be entirely free of NULL; float columns additionally must be
+    free of ``NaN`` / ``+Inf`` / ``-Inf``. Defaults off because
+    Redshift NULL is a documented expectation in many tables (per
+    CLAUDE.md's "except where NaN is documented as expected"); enable
+    only for tables where NULL/NaN indicates upstream corruption.
+
+    Output contract:
+      * Column order and names are preserved exactly as Redshift returns
+        them. Case follows Redshift's default lowercasing of unquoted
+        identifiers; double-quote identifiers in the SELECT list to
+        preserve mixed case.
+      * The returned DataFrame is NOT sorted — caller must sort
+        explicitly before any asof join.
+      * Row count equals the number of rows the server streamed; this
+        function never silently drops, dedupes, or truncates.
+      * ``expected_columns`` is a NAMES-ONLY contract; dtypes are not
+        compared. Downstream callers that need dtype guarantees should
+        follow up with ``df.cast(...)`` or validate ``df.schema``
+        explicitly at the call site.
+
+    Thread-safety: each call opens its own ODBC cursor via arrow_odbc and
+    holds no module-level state, so concurrent calls from independent
+    threads are safe. Callers must not share a returned DataFrame across
+    threads without their own synchronization (standard Polars rules).
+    """
+    # --- 1. Validate every input field at the inbound boundary ---------------
+    _validate_endpoint_identifiers(host=host, database=database, driver=driver)
+    _validate_query(query)
+    max_rows_val = _validate_numeric_params(
+        port=port,
+        batch_size=batch_size,
+        login_timeout_sec=login_timeout_sec,
+        query_timeout_sec=query_timeout_sec,
+        max_rows=max_rows,
+        max_text_size=max_text_size,
+        max_binary_size=max_binary_size,
+    )
+    _validate_bool_flags(
+        require_non_empty=require_non_empty,
+        allow_extra_columns=allow_extra_columns,
+        require_tz_aware_timestamps=require_tz_aware_timestamps,
+        require_finite_numerics=require_finite_numerics,
+        iam=iam,
+        auto_create=auto_create,
+    )
+    # Structural validation for caller-supplied sequences runs BEFORE
+    # the credential content sweep so a type error like
+    # ``parameters="?"`` or ``expected_columns={"a","b"}`` surfaces
+    # first. Otherwise a caller with multiple faults would chase the
+    # credential error (e.g. a trailing ``\n`` in a password copy-paste)
+    # while the more fundamental "wrong container type" went unmentioned.
+    params = _validate_parameters(parameters)
+    expected = _validate_expected_columns(expected_columns)
+    _validate_optional_credential_strings(
+        {
+            "user": user,
+            "password": password,
+            "aws_profile": aws_profile,
+            "aws_access_key_id": aws_access_key_id,
+            "aws_secret_access_key": aws_secret_access_key,
+            "aws_session_token": aws_session_token,
+            "aws_region": aws_region,
+            "cluster_id": cluster_id,
+            "db_user": db_user,
+            "ssl_mode": ssl_mode,
+        }
+    )
+    _validate_ssl_mode(ssl_mode)
+    _validate_conn_string_identifier_fields(
+        aws_profile=aws_profile,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        db_user=db_user,
+    )
+    _validate_iam_auth(
+        iam=iam,
+        user=user,
+        password=password,
+        aws_profile=aws_profile,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        db_user=db_user,
+        auto_create=auto_create,
+    )
+    db_groups_value = _validate_db_groups(db_groups, iam=iam)
+
+    # --- 2. Compose the ODBC connection string -------------------------------
+    conn_str = _build_connection_string(
+        driver=driver,
+        host=host,
+        port=port,
+        database=database,
+        iam=iam,
+        user=user,
+        password=password,
+        db_user=db_user,
+        db_groups_value=db_groups_value,
+        auto_create=auto_create,
+        cluster_id=cluster_id,
+        aws_region=aws_region,
+        aws_profile=aws_profile,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
+        ssl_mode=ssl_mode,
+    )
+
+    # --- 3. Open reader, stream rows, release cursor synchronously -----------
+    # All reader usage is wrapped so that the ODBC cursor is released
+    # synchronously in every exit path — normal return, caller-facing
+    # raise, or unexpected raise. In CPython `del reader` triggers
+    # arrow_odbc's Rust Drop immediately, so the server-side cursor is
+    # closed before any RedshiftIngestError propagates up the stack.
+    #
+    # ``secrets`` gathers every credential that was embedded into the
+    # ODBC connection string. Some drivers echo the conn string verbatim
+    # in error messages, so we scrub these substrings from any
+    # propagated arrow_odbc / driver exception text before surfacing it
+    # to the caller or to logs.
+    #
+    # Three nested try/finally layers, innermost-first:
+    #   * inner-1 (open):    clears ``conn_str`` / ``password`` / ``aws_*`` /
+    #                        ``query`` / ``params`` once arrow_odbc has
+    #                        internalized them.
+    #   * inner-2 (stream):  ``del reader`` so arrow_odbc's Rust Drop runs
+    #                        and the server-side cursor closes before any
+    #                        exception propagates.
+    #   * outer (secrets):   ``secrets = ()`` clears the credential snapshot
+    #                        on EVERY exit path — including an open-stage
+    #                        raise (where streaming never runs) and the
+    #                        None-reader path inside ``_open_arrow_reader``.
+    #                        Without this layer, ``secrets`` (an immutable
+    #                        tuple holding the original credential STRINGS)
+    #                        survives the open finally and frame-locals
+    #                        dumpers (sentry ``with_locals=True``, cgitb,
+    #                        rich) read it from the propagating exception's
+    #                        frame snapshot.
+    secrets = tuple(
+        s
+        for s in (
+            password,
+            aws_access_key_id,
+            aws_secret_access_key,
+            aws_session_token,
+        )
+        if s
+    )
+    try:
+        try:
+            reader = _open_arrow_reader(
+                conn_str=conn_str,
+                query=query,
+                parameters=params,
+                batch_size=batch_size,
+                login_timeout_sec=login_timeout_sec,
+                query_timeout_sec=query_timeout_sec,
+                max_text_size=max_text_size,
+                max_binary_size=max_binary_size,
+                user=user,
+                password=password,
+                iam=iam,
+                host=host,
+                database=database,
+                secrets=secrets,
+            )
+        finally:
+            conn_str = ""
+            password = None
+            aws_access_key_id = None
+            aws_secret_access_key = None
+            aws_session_token = None
+            query = ""
+            params = None
+        try:
+            schema = _read_arrow_schema(reader, secrets=secrets)
+            schema_names = _check_schema_no_duplicates(schema)
+            batches, total_rows = _stream_batches(
+                reader,
+                max_rows=max_rows_val,
+                host=host,
+                database=database,
+                secrets=secrets,
+            )
+        finally:
+            del reader
+    finally:
+        # Outer finally: clear the credential snapshot on EVERY exit path
+        # of the function — open-raise (including the None-reader case
+        # inside ``_open_arrow_reader``), streaming-raise, post-load raise,
+        # success. Without this, the immutable ``secrets`` tuple would
+        # survive the open finally and be readable from the propagating
+        # exception's frame by sentry/cgitb/rich. Post-load exceptions
+        # (arrow/polars conversion, expected-columns mismatch, tz-aware /
+        # non-empty / finiteness checks) likewise cannot carry credentials
+        # past this point.
+        secrets = ()
+
+    # --- 4. Convert to Polars while preserving invariants --------------------
+    table = _assemble_arrow_table(batches, schema, total_rows)
+    df = _arrow_table_to_polars(
+        table, schema_names=schema_names, expected_rows=total_rows
+    )
+
+    # --- 5. Caller-facing post-load contract checks --------------------------
+    # Post-load contract checks ordered to match the CLAUDE.md inbound
+    # boundary contract enumeration: schema (1), timezone (2), row
+    # count (3), finiteness (4). Universe-sanity (5) and timestamp
+    # monotonicity (6) are caller-knowledge and stay caller-side.
+    _check_expected_columns(
+        df, expected, allow_extra_columns=allow_extra_columns
+    )
+    _check_tz_aware_timestamps(df, require=require_tz_aware_timestamps)
+    _check_non_empty(
+        df, require=require_non_empty, host=host, database=database
+    )
+    _check_finite_numerics(df, require=require_finite_numerics)
+
+    return df
+

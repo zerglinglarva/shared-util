@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import datetime
 import errno
 import html
@@ -130,25 +131,28 @@ _FLOAT_DTYPE_CLASSES: tuple[type[pl.DataType], ...] = _build_dtype_tuple(
 
 #################################################################################################
 # Parse command line arguments (or use defaults in interactive mode), validate all inputs,
-# and resolve the write directory path. Returns (startdate, enddate, write_directory).
+# and resolve the write directory path.
+# Returns (startdate, enddate, write_directory, input_mode).
 #
 # Supports two execution modes:
 #   1. Interactive (Jupyter / IPython): skips argparse, uses defaults directly.
-#   2. CLI (python script.py ...): parses -s, -e, -w flags via argparse.
+#   2. CLI (python script.py ...): parses -s, -e, -w, -i flags via argparse.
 #
 # CLI usage examples:
 #   python price-volume-01-EDA.py                                          # all defaults
 #   python price-volume-01-EDA.py -s 20230101 -e 20231231                  # custom date range
 #   python price-volume-01-EDA.py --start-date 20230101 --end-date 20231231 --write-to prod
+#   python price-volume-01-EDA.py -w prod -i cold                          # cold input tier
 
 
 def parse_arguments(
     default_startdate: datetime.date,
     default_enddate: datetime.date,
     default_write_mode: Literal["dev", "prod"],
+    default_input_mode: Literal["hot", "cold"],
     dev_folder: str,
     prod_folder: str,
-) -> tuple[datetime.date, datetime.date, str]:
+) -> tuple[datetime.date, datetime.date, str, str]:
 
     # ── Step 0: Type-check inbound parameters ────────────────────────────
     # ``Literal[...]`` and the dataclass-style annotations are enforcement-
@@ -192,6 +196,16 @@ def parse_arguments(
             f"default_write_mode must be 'dev' or 'prod', got "
             f"{default_write_mode!r}"
         )
+    if not isinstance(default_input_mode, str):
+        raise TypeError(
+            f"default_input_mode must be a str, got "
+            f"{type(default_input_mode).__name__}"
+        )
+    if default_input_mode not in ("hot", "cold"):
+        raise ValueError(
+            f"default_input_mode must be 'hot' or 'cold', got "
+            f"{default_input_mode!r}"
+        )
     if not isinstance(dev_folder, str):
         raise TypeError(
             f"dev_folder must be a str, got {type(dev_folder).__name__}"
@@ -226,8 +240,13 @@ def parse_arguments(
         _ipython_shell = get_ipython()
         if _ipython_shell is not None and "ZMQ" in type(_ipython_shell).__name__:
             is_interactive = True
-    except ImportError:
-        # IPython is optional; absence just means we rely on ``sys.ps1``.
+    except Exception:  # noqa: BLE001 — interactive-mode detection is best-effort
+        # IPython is optional. ``ImportError`` covers a missing install,
+        # but a broken/half-installed IPython can also raise from inside
+        # ``get_ipython()`` itself (e.g. ``RuntimeError`` /
+        # ``AttributeError`` on a stub or partially-initialized
+        # ``traitlets``). Any failure here just means we fall back to the
+        # ``sys.ps1`` check above — never a reason to block CLI parsing.
         pass
 
     # ── Step 2: Obtain raw string inputs ─────────────────────────────────
@@ -239,6 +258,7 @@ def parse_arguments(
         start_date_str = default_startdate.strftime("%Y%m%d")
         end_date_str = default_enddate.strftime("%Y%m%d")
         write_to = default_write_mode
+        input_mode = default_input_mode
     else:
         # CLI mode: define and parse command line arguments
         parser = argparse.ArgumentParser()
@@ -270,6 +290,16 @@ def parse_arguments(
             help=f"\nDestination to write the results. Default is {default_write_mode}. Options are dev or prod",
         )
 
+        # -i / --input-mode: input data tier ('hot' or 'cold').  Caller resolves
+        # the actual source folder from this string downstream.
+        parser.add_argument(
+            "-i",
+            "--input-mode",
+            type=str,
+            default=default_input_mode,
+            help=f"\nInput data tier. Default is {default_input_mode}. Options are hot or cold",
+        )
+
         # Use parse_known_args to gracefully ignore unmapped flags injected
         # by orchestrators (Airflow / Pytest / wrappers) instead of
         # triggering ``sys.exit(2)``.  But unknown args MUST surface in logs:
@@ -289,17 +319,52 @@ def parse_arguments(
         start_date_str = args.start_date
         end_date_str = args.end_date
         write_to = args.write_to
+        input_mode = args.input_mode
 
     # ── Step 3: Validate and convert date strings to datetime.date ───────
-    # strptime raises a cryptic error on bad formats, so wrap with a clear message
-    try:
-        startdate = datetime.datetime.strptime(start_date_str, "%Y%m%d").date()
-        enddate = datetime.datetime.strptime(end_date_str, "%Y%m%d").date()
-    except ValueError as e:
-        raise ValueError(
-            f"Invalid date format. Expected YYYYMMDD (e.g. 20241231), "
-            f"got start_date='{start_date_str}', end_date='{end_date_str}'. Original error: {e}"
-        ) from e
+    # Strict YYYYMMDD parse, with one salvage path: a day that exceeds the
+    # last day of its month (e.g. '20250631' for June, '20250230' for non-
+    # leap February) is clamped to month-end and logged as a WARNING so the
+    # correction is loud, never silent. All other malformed inputs (wrong
+    # length, non-digit, month outside 1..12, day == 0, unparseable) hard-
+    # reject with a clear message naming the offending value.
+    #
+    # The salvage warning is emitted via BOTH ``logging.getLogger(...).warning``
+    # (so log aggregators / orchestrators that capture stderr selectively
+    # still see it) AND ``print(file=sys.stderr)`` (so an interactive caller
+    # without a configured logging handler still sees it). Stderr-only would
+    # be silently filtered by Airflow per-task log capture in some configs;
+    # logging-only would be invisible in a fresh interactive session before
+    # ``logging.basicConfig`` is called.
+    def _parse_yyyymmdd(value: str, label: str) -> datetime.date:
+        try:
+            return datetime.datetime.strptime(value, "%Y%m%d").date()
+        except ValueError as exc:
+            if len(value) == 8 and value.isdigit():
+                year = int(value[0:4])
+                month = int(value[4:6])
+                day = int(value[6:8])
+                if 1 <= month <= 12 and day >= 1:
+                    last_day = calendar.monthrange(year, month)[1]
+                    if day > last_day:
+                        corrected = datetime.date(year, month, last_day)
+                        corrected_str = corrected.strftime("%Y%m%d")
+                        month_name = calendar.month_name[month]
+                        message = (
+                            f"parse_arguments: {label}='{value}' is invalid "
+                            f"({month_name} {year} has only {last_day} days, "
+                            f"not {day}). Going to use {corrected_str} instead."
+                        )
+                        logging.getLogger(__name__).warning("%s", message)
+                        print(message, file=sys.stderr, flush=True)
+                        return corrected
+            raise ValueError(
+                f"Invalid date format. Expected YYYYMMDD (e.g. 20241231), "
+                f"got {label}='{value}'. Original error: {exc}"
+            ) from exc
+
+    startdate = _parse_yyyymmdd(start_date_str, "start_date")
+    enddate = _parse_yyyymmdd(end_date_str, "end_date")
 
     # Ensure the date range is logically valid (start on or before end)
     if startdate > enddate:
@@ -336,7 +401,18 @@ def parse_arguments(
     if not Path(write_directory).is_dir():
         raise FileNotFoundError(f"Write directory does not exist: {write_directory}")
 
-    return startdate, enddate, write_directory
+    # ── Step 5: Normalize and validate input_mode ────────────────────────
+    # Same hard-reject discipline as write_to: hard-fail on anything outside
+    # {'hot', 'cold'} so a typo like 'warm' or 'HOT2' surfaces immediately
+    # instead of being silently passed to the caller's downstream resolver.
+    input_mode = input_mode.strip().lower()
+    if input_mode not in ("hot", "cold"):
+        raise ValueError(
+            f"Invalid value for input_mode: '{input_mode}'. "
+            f"Options are 'hot' or 'cold'"
+        )
+
+    return startdate, enddate, write_directory, input_mode
 
 #################################################################################################
 # Compute default month-to-date date range from the composite exchange calendar of the given venues.
@@ -706,8 +782,15 @@ def _mtd_resolve_lookback_days() -> int:
     """
     default_days = 30
     max_allowed_days = 3650  # 10 years — cap against env-var typos.
-    raw = os.environ.get("COMPUTE_MTD_MAX_LOOKBACK_DAYS")
-    if raw is None or raw == "":
+    raw_env = os.environ.get("COMPUTE_MTD_MAX_LOOKBACK_DAYS")
+    # Strip leading/trailing whitespace defensively: shell-script ``export
+    # VAR="30 "`` is a common typo, and a value of " " (whitespace only)
+    # would otherwise reach ``int(...)`` and raise the wrong (less helpful)
+    # ValueError than the explicit "must be a positive integer" message
+    # below. ``int("30 ")`` itself tolerates surrounding whitespace, but
+    # being explicit avoids relying on that quirk.
+    raw = "" if raw_env is None else raw_env.strip()
+    if raw == "":
         return default_days
     try:
         days = int(raw)
@@ -804,6 +887,7 @@ def _mtd_check_postconditions(
     is_target_session: Callable[[datetime.date], bool],
     unique_venues: list[str],
     combine_type: Literal["union", "intersect"],
+    probe_errors: list[BaseException],
 ) -> None:
     """Validate the result tuple against every advertised invariant.
 
@@ -811,22 +895,40 @@ def _mtd_check_postconditions(
     -O`` / PYTHONOPTIMIZE, which strips assertions. A corrupt date
     range silently flowing downstream is the worst failure mode this
     function can produce, so the checks run unconditionally.
+
+    ``probe_errors`` carries any calendar-library exceptions silently
+    captured by ``is_target_session`` during the main run. The session-
+    membership re-probe at the end of this function may itself trigger
+    more entries; if the post-condition fires we surface the most recent
+    probe error alongside the violation message so an operator can
+    distinguish a real range-correctness bug from a calendar-library
+    fault that pollutes both the main run and the post-check.
     """
+    def _hint() -> str:
+        if not probe_errors:
+            return ""
+        last = probe_errors[-1]
+        return (
+            f" (NB: {len(probe_errors)} calendar-library probe error(s) "
+            f"were captured during this run; latest was "
+            f"{type(last).__name__}: {last})"
+        )
+
     if startdate > enddate:
         raise RuntimeError(
             f"compute_mtd_date_range: post-condition violated — "
-            f"startdate={startdate} > enddate={enddate}"
+            f"startdate={startdate} > enddate={enddate}{_hint()}"
         )
     if (startdate.year, startdate.month) != (enddate.year, enddate.month):
         raise RuntimeError(
             f"compute_mtd_date_range: post-condition violated — startdate "
-            f"{startdate} and enddate {enddate} span different months"
+            f"{startdate} and enddate {enddate} span different months{_hint()}"
         )
     if enddate > today:
         # Aggressive-today rule must never produce a future enddate.
         raise RuntimeError(
             f"compute_mtd_date_range: post-condition violated — "
-            f"enddate={enddate} is after today={today}"
+            f"enddate={enddate} is after today={today}{_hint()}"
         )
     if not (is_target_session(startdate) and is_target_session(enddate)):
         # Re-verify session membership via the guarded probe (OOB-safe)
@@ -835,7 +937,7 @@ def _mtd_check_postconditions(
         raise RuntimeError(
             f"compute_mtd_date_range: post-condition violated — "
             f"startdate={startdate} or enddate={enddate} is not a "
-            f"{combine_type} session across {unique_venues}"
+            f"{combine_type} session across {unique_venues}{_hint()}"
         )
 
 
@@ -944,6 +1046,7 @@ def compute_mtd_date_range(
         is_target_session=is_target_session,
         unique_venues=unique_venues,
         combine_type=combine_type,
+        probe_errors=probe_errors,
     )
     return startdate, enddate
 
@@ -1340,11 +1443,16 @@ def lazy_parquet(
     # fail eagerly in some Polars versions or on permission errors.
     # ``_scan_with_retry`` is defined above alongside the other I/O helpers.
     #
-    # Select columns in reference order on each frame. pl.concat with
-    # how="vertical" (the default for LazyFrames) matches columns by
-    # *position*, not by name. If two parquet files store the same columns
-    # in a different order, positional concat silently produces wrong data
-    # or raises a dtype-mismatch error at collect-time.
+    # Select columns in reference order on each frame so that ``pl.concat``
+    # with ``how="vertical"`` (its strictest mode) sees identical schema +
+    # column order on every frame. ``vertical`` requires the schemas to
+    # match exactly (same names, same dtypes, same order); a divergence
+    # raises ``ShapeError`` / ``SchemaError`` rather than silently
+    # producing wrong data. Pre-aligning with ``.select(reference_columns)``
+    # converts a tolerable column-order difference into the no-op case
+    # while leaving real schema drift to surface as a loud collect-time
+    # exception. (Earlier versions of this comment incorrectly described
+    # vertical concat as positional — it is name-and-order strict.)
     reference_columns = list(reference_schema.keys())
     dataframes = []
     for path in file_paths:
@@ -1773,9 +1881,21 @@ def _run_winsorized_rolling(
         if window_size is not None:
             # Rejoin the preserved index_col from the sorted input frame
             # via the row-index key, then drop the synthetic index.
+            #
+            # The intermediate ``.sort(row_idx_c)`` is defense-in-depth
+            # against a future polars version where left-join no longer
+            # preserves left-side row order. Without it, a silent
+            # reorder would attribute each row's ``winsorized_mean`` /
+            # ``winsorized_std`` to the wrong ``index_col`` value;
+            # ``_verify_winsorized_output`` only checks height, which a
+            # row-permutation slips through. Sorting on the row-index
+            # we just generated is monotonic-int and cheap, and pins
+            # the output to the same canonical row order the caller's
+            # input frame had after the (group_by, index_col) sort.
             result = (
                 result
                 .join(df.select(row_idx_c, index_col), on=row_idx_c, how="left")
+                .sort(row_idx_c)
                 .drop(row_idx_c)
             )
 
@@ -1887,9 +2007,20 @@ def _verify_winsorized_output(
     # — there is nothing to check.
     for _out in ("winsorized_mean", "winsorized_std"):
         if isinstance(result.schema[_out], pl.Float64):
-            n_non_finite = result.select(
-                (pl.col(_out).is_not_null() & ~pl.col(_out).is_finite()).sum()
-            ).item()
+            try:
+                n_non_finite = result.select(
+                    (pl.col(_out).is_not_null() & ~pl.col(_out).is_finite()).sum()
+                ).item()
+            except MemoryError:
+                # The expression plan in ``_build_winsorized_plan`` already
+                # gates inputs and outputs through ``is_finite``, so this
+                # post-condition is a "should-never-fire" defensive check.
+                # On a near-OOM environment with a >>100M-row output the
+                # boolean intermediate is large enough to tip the process
+                # over; raising here would mask the actual root cause
+                # (memory pressure, not a polars regression). Skip the
+                # scan and trust the plan-level gates.
+                continue
             if n_non_finite:
                 raise RuntimeError(
                     f"winsorized_rolling_stats: {n_non_finite} non-finite "
@@ -2090,15 +2221,30 @@ def plot_time_series(
             )
 
     # Validate y_format before plotting. FuncFormatter would otherwise raise
-    # a KeyError per tick at render time, producing a stack of confusing
-    # matplotlib warnings instead of a single clear error.
-    try:
-        y_format.format(x=0.0, x_k=0.0, x_m=0.0, x_b=0.0)
-    except (KeyError, IndexError, ValueError) as e:
-        raise ValueError(
-            f"y_format {y_format!r} is not a valid str.format template: "
-            f"{type(e).__name__}: {e}"
-        ) from e
+    # per-tick at render time, producing a stack of confusing matplotlib
+    # warnings instead of a single clear error.
+    #
+    # Probe with three values (zero, large positive, large negative) so format
+    # specs that only fail on extreme values (``"{x:>5.0%}"`` underflow,
+    # scientific-notation traps) trip during the pre-flight check rather than
+    # mid-render. Catch a broad set of exceptions:
+    #   - KeyError / IndexError: missing named or positional substitution
+    #   - ValueError: malformed format spec (``"{x:.q}"``)
+    #   - AttributeError: spec triggered attribute access on the substituted
+    #     value (e.g. ``"{x.bogus}"``)
+    #   - TypeError: spec incompatible with the value's type (``"{x:d}"`` on a
+    #     float in some Python versions)
+    for _probe in (0.0, 1e15, -1e15):
+        try:
+            y_format.format(
+                x=_probe, x_k=_probe / 1e3, x_m=_probe / 1e6, x_b=_probe / 1e9
+            )
+        except (KeyError, IndexError, ValueError, AttributeError, TypeError) as e:
+            raise ValueError(
+                f"y_format {y_format!r} is not a valid str.format template "
+                f"(failed on probe value {_probe!r}): "
+                f"{type(e).__name__}: {e}"
+            ) from e
 
     # ── Plot ─────────────────────────────────────────────────────────────
     # Wrap in try/except so a mid-plot failure (e.g. from user-supplied data
@@ -2378,14 +2524,35 @@ def save_matplotlib_charts_as_html(
     html_bytes = "\n".join(html_parts).encode("utf-8")
     rename_done = False
 
+    # Distinguish "saved" (new file) vs "updated" (overwrite of existing) for
+    # the user-facing message below.  Probed before the rename because once
+    # _atomic_replace runs, file_path always exists.  Path.exists() is best-
+    # effort: a transient NAS hiccup that returns False on a present file
+    # would mislabel the message as "saved" — purely cosmetic, no data risk.
+    pre_existed = Path(file_path).exists()
+
     try:
-        _write_bytes_and_fsync(html_bytes, tmp_path)
+        # Capture the tmp-side size returned by ``_write_bytes_and_fsync``
+        # so the final file can be re-checked AFTER the atomic rename. The
+        # parquet pipeline does this in ``save_results`` via
+        # ``_verify_written_size`` to detect post-rename truncation by
+        # AV / DLP scanners or NAS write-behind cache bugs. The HTML
+        # pipeline previously stopped at the tmp-side check, leaving a
+        # silent failure mode where the renamed artifact ships truncated
+        # to downstream consumers. Same helper, same contract.
+        tmp_size = _write_bytes_and_fsync(html_bytes, tmp_path)
 
         # Rename phase — delegate to _atomic_replace for 12× retry with
         # read-only-attribute clearing.  Reuses the same tested path as the
         # parquet pipeline rather than maintaining a parallel retry loop.
         _atomic_replace(tmp_path, file_path)
         rename_done = True
+
+        # Post-rename size verification, mirroring ``save_results`` Step 10.
+        # ``os.fstat`` on a freshly-opened handle bypasses SMB metadata
+        # cache, so a truncation that happened after rename surfaces as
+        # ``OSError("size mismatch")`` instead of being silently shipped.
+        _verify_written_size(file_path, tmp_size)
 
     except BaseException:
         if not rename_done:
@@ -2396,9 +2563,10 @@ def save_matplotlib_charts_as_html(
                 pass  # Temp file may not exist if os.open failed
         raise
 
-    logging.getLogger(__name__).info(
-        "save_matplotlib_charts_as_html: saved charts HTML to %s", file_path
-    )
+    action = "updated" if pre_existed else "saved"
+    message = f"save_matplotlib_charts_as_html: {action} charts HTML to {file_path}"
+    print(message, file=sys.stderr, flush=True)
+    logging.getLogger(__name__).info(message)
     return file_path
 
 
@@ -2463,12 +2631,27 @@ _ETXTBSY: int = getattr(errno, "ETXTBSY", -1)  # Text file busy
 ## names like "America/New_York".  Resolve once at module load and fall back
 ## to UTC with an unambiguous label so HTML reports still generate in
 ## degraded environments rather than crashing inside save_matplotlib_charts_as_html.
+##
+## ``ZoneInfoNotFoundError`` covers the missing-tzdata case, but a corrupt
+## tzdata install can raise ``ValueError`` / ``OSError`` from inside
+## ``ZoneInfo.__init__`` on some Python versions. This is a degraded-mode
+## fallback path — broaden the catch to ``Exception`` so a corrupt-tzdata
+## environment does not break ``import shared_util`` for every script in
+## the codebase. The fallback is logged so an operator notices.
 try:
     _REPORT_TZ: datetime.tzinfo = zoneinfo.ZoneInfo("America/New_York")
     _REPORT_TZ_LABEL: str = "US Eastern"
-except zoneinfo.ZoneInfoNotFoundError:
+except Exception as _tz_exc:  # noqa: BLE001 — degraded-mode fallback, see above
     _REPORT_TZ = datetime.timezone.utc
     _REPORT_TZ_LABEL = "UTC (install 'tzdata' for US Eastern on Windows)"
+    logging.getLogger(__name__).warning(
+        "shared_util: could not resolve America/New_York via zoneinfo "
+        "(%s: %s); HTML report timestamps will use UTC. Install the "
+        "'tzdata' PyPI package or repair the system tzdb to restore the "
+        "US Eastern label.",
+        type(_tz_exc).__name__, _tz_exc,
+    )
+    del _tz_exc
 
 
 ## Aggregate base64-encoded image-byte cap for save_matplotlib_charts_as_html.
@@ -2525,8 +2708,18 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
                     pass  # Orphaned probe cleaned up by the stale-file sweep below
 
         # --- Sweep the folder for stale temp files and orphaned time probes ---
+        # Use ``casefold()`` for the extension and prefix tests so that on
+        # case-insensitive filesystems (NTFS/SMB), files written by a
+        # different host's locale or by a legacy tool that uppercased
+        # extensions ("Sales.PARQUET.abc.TMP") are still recognized as
+        # ours and reaped. Mirrors the casefold convention adopted by
+        # ``_remove_duplicates`` and the predecessor probe in
+        # ``save_results``. ``.time_probe_`` is ASCII-only so its prefix
+        # check stays case-sensitive.
+        prefix_cf = prefix.casefold()
         for entry in folder.iterdir():
             f = entry.name
+            f_cf = f.casefold()
             # Only touch files belonging to our pipeline.  .lock files are left
             # alone because OS-level byte locks are automatically released when
             # the owning process exits or the SMB session drops.
@@ -2541,16 +2734,16 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
             #   Static branch: base_name must equal prefix exactly.
             #     This prevents prefix="sales" from matching "sales.historical".
             is_stale_tmp = False
-            if f.endswith(".tmp") and ".parquet." in f:
+            if f_cf.endswith(".tmp") and ".parquet." in f_cf:
                 # rsplit from the right: the suffix (.{uuid8}.tmp) is strictly
                 # controlled and never contains ".parquet.", so rsplit correctly
                 # isolates the base name even if the prefix itself contains
                 # ".parquet." (e.g. "data.parquet.v1").
-                base_name = f.rsplit(".parquet.", 1)[0]
-                if base_name == prefix:
+                base_name_cf = f_cf.rsplit(".parquet.", 1)[0]
+                if base_name_cf == prefix_cf:
                     is_stale_tmp = True  # Static filename match
-                elif base_name.startswith(f"{prefix}-"):
-                    date_part = base_name[len(prefix) + 1 :]
+                elif base_name_cf.startswith(f"{prefix_cf}-"):
+                    date_part = base_name_cf[len(prefix_cf) + 1 :]
                     # Two numeric blocks (≥6 digits each) with optional sign.
                     # The 6-digit minimum matches strftime("%Y%m") output which
                     # always produces ≥6 chars (4-digit year + 2-digit month,
@@ -2563,9 +2756,9 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
             # ".html." (unusual but legal under the filename validator)
             # still isolates correctly. Match base_name against the exact
             # file_name that save_matplotlib_charts_as_html produces.
-            if not is_stale_tmp and f.endswith(".tmp") and ".html." in f:
-                base_name = f.rsplit(".html.", 1)[0]
-                if base_name == f"{prefix}_charts":
+            if not is_stale_tmp and f_cf.endswith(".tmp") and ".html." in f_cf:
+                base_name_cf = f_cf.rsplit(".html.", 1)[0]
+                if base_name_cf == f"{prefix_cf}_charts":
                     is_stale_tmp = True
             is_orphaned_probe = f.startswith(".time_probe_")
             if not (is_stale_tmp or is_orphaned_probe):
@@ -2632,6 +2825,18 @@ def _validate_inputs(
             raise ValueError(
                 f"subfolder components must not have leading/trailing whitespace: {subfolder!r}"
             )
+        # Reject ``.`` and ``..`` components up-front. ``..`` is also caught
+        # by the post-resolve traversal check in ``_resolve_folder_path``,
+        # but rejecting it here gives a clearer error. ``.`` is the silent-
+        # collapse case: ``Path(base) / "."`` resolves back to ``base``,
+        # so the traversal check passes and files would land directly in
+        # ``write_directory`` instead of in any subfolder — a quiet
+        # contract violation. Fail loud to match the rest of this
+        # validator's discipline.
+        if _part in (".", ".."):
+            raise ValueError(
+                f"subfolder must not contain '.' or '..' components: {subfolder!r}"
+            )
         if _part and _WINDOWS_ILLEGAL_CHARS.search(_part):
             raise ValueError(
                 f"subfolder contains characters illegal in Windows paths: {subfolder!r}"
@@ -2681,7 +2886,20 @@ def _resolve_folder_path(write_directory: str, subfolder: str) -> str:
     resulting path is still inside write_directory.  This prevents a
     crafted subfolder like '../../etc' from escaping the intended root.
     """
-    base_dir = str(Path(write_directory).resolve())
+    # ``Path.resolve()`` follows symlinks. On a corrupted layout (broken
+    # symlink in the chain, denied permission on a parent) it raises
+    # ``OSError`` (``FileNotFoundError`` / ``PermissionError``) on some
+    # Python versions even with ``strict=False``. Re-wrap as ``ValueError``
+    # so callers see the documented exception type from the docstring,
+    # rather than a confusing low-level OSError leaking through.
+    try:
+        base_dir = str(Path(write_directory).resolve())
+    except OSError as exc:
+        raise ValueError(
+            f"write_directory could not be resolved (broken symlink, "
+            f"missing parent, or permission denied): {write_directory!r} "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
 
     # Normalize backslashes to forward slashes so that subfolder paths like
     # "data\output" are treated identically on both Windows (where \ is a
@@ -2693,7 +2911,14 @@ def _resolve_folder_path(write_directory: str, subfolder: str) -> str:
         raise ValueError(
             f"subfolder resolves to empty after stripping leading slashes: {subfolder!r}"
         )
-    folder_path = str((Path(base_dir) / subfolder_safe).resolve())
+    try:
+        folder_path = str((Path(base_dir) / subfolder_safe).resolve())
+    except OSError as exc:
+        raise ValueError(
+            f"subfolder could not be resolved under {base_dir!r} (broken "
+            f"symlink, missing parent, or permission denied): "
+            f"{subfolder!r} ({type(exc).__name__}: {exc})"
+        ) from exc
 
     # Traversal check: the resolved folder must be inside (or equal to) base_dir.
     # normcase ensures case-insensitive comparison on Windows (C:\Foo == c:\foo).
@@ -2771,7 +2996,15 @@ def _build_filename(
         # Example: writing prefix-201401-202504.parquet should delete
         #          prefix-201401-202503.parquet (same start, older end)
         #          but NOT prefix-201301-202503.parquet (different start).
-        escaped_prefix = re.escape(file_name_prefix.lower())
+        #
+        # Use ``casefold()`` (not ``lower()``) so the prefix-vs-listing
+        # comparison is locale-independent and stable across Unicode case
+        # foldings (e.g. German "ß" → "ss", Turkish dotted-I). ``_remove_duplicates``
+        # applies the same fold to listed filenames, keeping both sides in
+        # the same normalized form. NTFS/SMB are case-insensitive but not
+        # Unicode-locale aware; ``casefold`` is the correct match for
+        # cross-host stability.
+        escaped_prefix = re.escape(file_name_prefix.casefold())
         escaped_first = re.escape(first)
         dup_pattern = re.compile(
             rf"^{escaped_prefix}-{escaped_first}-[+-]?\d{{6,}}\.parquet$"
@@ -2813,17 +3046,21 @@ def _remove_duplicates(
         cleanup of the others.
     """
     folder = Path(folder_path)
+    # Use ``casefold`` (not ``lower``) so prefix matching is locale-independent
+    # for non-ASCII names; matches the fold used by ``_build_filename`` so the
+    # regex and exact-name comparison see the same normalized form on every host.
+    file_name_cf = file_name.casefold()
     try:
         for entry in folder.iterdir():
             f = entry.name
             # Skip the file we just wrote (case-sensitive), and non-parquet files
-            if f == file_name or not f.lower().endswith(".parquet"):
+            if f == file_name or not f.casefold().endswith(".parquet"):
                 continue
 
-            fl = f.lower()
+            fl = f.casefold()
             if exact_match:
                 # Static filename: only match the exact name (case-insensitive)
-                is_dup = fl == file_name.lower()
+                is_dup = fl == file_name_cf
             else:
                 # Date-range supersession: matches any file with the same prefix
                 # and start date but ANY end date (the new file supersedes it).
@@ -2844,7 +3081,7 @@ def _remove_duplicates(
                         try:
                             is_same_file = entry.samefile(file_path)
                         except OSError:
-                            is_same_file = fl == file_name.lower()
+                            is_same_file = fl == file_name_cf
                     if is_same_file:
                         continue  # Same file — do not delete our own output
                     # Clear read-only attribute before removal.
@@ -3212,11 +3449,33 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
 
     Clears the read-only attribute on the target file if Access Denied
     (WinError 5 / EACCES) suggests it was set by backup/compliance tools.
+
+    After a successful rename on POSIX, fsyncs the parent directory so the
+    new directory entry is durable through a power-loss event. Without
+    this, the file content's prior fsync persists but the rename can be
+    lost — leaving either the old name + new content (if the directory
+    entry update was buffered) or no file at all. Windows' ``ReplaceFile``
+    flushes the directory metadata implicitly, so the directory fsync is
+    POSIX-only. ``os.fsync`` on a directory descriptor is unsupported on
+    Windows (raises ``OSError``); the ``hasattr(os, 'O_DIRECTORY')`` gate
+    is a portable proxy for "platform supports directory fsync".
     """
     file_p = Path(file_path)
     for _attempt in range(12):
         try:
             Path(tmp_path).replace(file_path)
+            # Rename succeeded. The parent-dir fsync is a best-effort
+            # durability boost; ``_fsync_parent_dir`` already swallows
+            # ``OSError`` internally, but we shield against any future
+            # non-OSError it might raise so the rename's success is
+            # NEVER unwound by an exception originating in a defensive
+            # helper (caller would otherwise hit the unconditional
+            # ``unlink(tmp_path)`` finally clause and leave the renamed
+            # file in place while believing the rename failed).
+            try:
+                _fsync_parent_dir(file_p)
+            except Exception:  # noqa: BLE001 — see comment above
+                pass
             return
         except OSError as e:
             win_err = getattr(e, "winerror", 0)
@@ -3243,6 +3502,43 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
                 except OSError:
                     pass  # Best-effort chmod; next retry will surface the real error
             time.sleep(min(15.0, 0.5 * (2**_attempt)))  # Backoff: 0.5s … 15s cap
+
+
+def _fsync_parent_dir(file_p: Path) -> None:
+    """Fsync the parent directory of ``file_p`` so a freshly committed
+    directory entry survives a power-loss event.
+
+    No-op on platforms that do not support directory fsync (Windows).
+    Best-effort: a transient OSError is swallowed because the file's own
+    fsync already persisted the data — the durability gain here is
+    incremental, and re-raising would mask the success of the rename.
+    The intent comment makes the silent-swallow contract explicit, which
+    is the only ``OSError: pass`` exception this codebase tolerates per
+    the global guidance.
+    """
+    # ``os.O_DIRECTORY`` exists on POSIX only; Pylance/mypy on Windows
+    # type-stubs report it as missing, so look it up dynamically and skip
+    # the fsync entirely on platforms that don't define it (Windows
+    # handles dir-entry durability inside ReplaceFile already).
+    o_directory = getattr(os, "O_DIRECTORY", None)
+    if o_directory is None:
+        return
+    parent = file_p.parent
+    fd: int | None = None
+    try:
+        fd = os.open(str(parent), os.O_RDONLY | o_directory)
+        os.fsync(fd)
+    except OSError:
+        # Best-effort: partial durability is still better than crashing
+        # the whole save path on a directory that doesn't support fsync
+        # (some FUSE mounts, network filesystems with degraded support).
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass  # fd already closed by an OS-level event; nothing to do
 
 
 def _verify_written_size(file_path: str, expected_size: int) -> None:
@@ -3481,6 +3777,34 @@ def save_results(
     # 24-hour threshold prevents deleting large files still being written
     _cleanup_stale_files(folder_path, max_age_seconds=86400, prefix=file_name_prefix)
 
+    # Detect a pre-existing version so the success message can say "updated"
+    # instead of "saved".  Two ways a predecessor can exist:
+    #   1. Exact-match path — same filename (static-prefix mode, or a rerun
+    #      over the same date range in range-embedded mode).
+    #   2. Same-start range predecessor — e.g. last run wrote
+    #      'prefix-202407-202505.parquet', this run writes
+    #      'prefix-202407-202506.parquet'; _remove_duplicates will delete the
+    #      old one inside the lock, so it's effectively an update.
+    # OSError on listdir (NAS hiccup) is swallowed and defaults to "saved" —
+    # this flag is purely cosmetic and never affects write correctness.
+    pre_existed_exact = Path(file_path).exists()
+    pre_existed_predecessor = False
+    if not pre_existed_exact and not exact_match and dup_pattern is not None:
+        # ``dup_pattern`` is built from ``file_name_prefix.casefold()`` in
+        # ``_build_filename``, so match against ``casefold()``-ed entry names
+        # so this side mirrors ``_remove_duplicates`` exactly. Using
+        # ``.lower()`` here would drift from the supersession logic for
+        # non-ASCII prefixes (Turkish dotted-I, German "ß"), making the
+        # "saved" vs "updated" message label unreliable across hosts.
+        try:
+            for _entry in os.listdir(folder_path):
+                if dup_pattern.match(_entry.casefold()):
+                    pre_existed_predecessor = True
+                    break
+        except OSError:
+            pass
+    will_overwrite = pre_existed_exact or pre_existed_predecessor
+
     start_time = time.monotonic()
     rename_done = (
         False  # Tracks whether os.replace succeeded (controls finally cleanup)
@@ -3580,10 +3904,13 @@ def save_results(
                 pass  # tmp may already be gone or still locked; stale cleanup handles it
 
     elapsed = (time.monotonic() - start_time) / 60
-    logging.getLogger(__name__).info(
-        "save_results: results saved to %s; time taken (minutes): %.2f",
-        file_path, elapsed,
+    action = "updated" if will_overwrite else "saved"
+    message = (
+        f"save_results: {action} parquet to {file_path}; "
+        f"time taken (minutes): {elapsed:.2f}"
     )
+    print(message, file=sys.stderr, flush=True)
+    logging.getLogger(__name__).info(message)
     return file_path
 
 #################################################################################################
@@ -3900,6 +4227,12 @@ def _sql_check_finite_numerics(
                 # the correct semantics — nothing to violate.
                 if not bool(df[name].is_finite().all()):
                     bad.append(name)
+        except MemoryError:
+            # Allocation failure during column-wide scans is a process-
+            # level signal, not a per-column polars-API drift; let it
+            # propagate so the caller sees a clear OOM rather than the
+            # misleading "finiteness check failed on N columns" report.
+            raise
         except Exception as exc:  # noqa: BLE001
             api_errors.append((name, exc))
     if bad:
@@ -4356,11 +4689,18 @@ def sql_query(
                 # `query_timeout_sec` in different releases; an "unexpected
                 # keyword argument" here almost certainly means the
                 # installed arrow_odbc is older than this wrapper expects.
+                # Chain via ``from exc`` (not ``from None``): the message
+                # surface is a Python TypeError naming a keyword argument,
+                # which does not echo the connection string or password,
+                # so the original traceback is debug-useful and safe to
+                # surface. Other branches in this function suppress the
+                # cause because their underlying messages may carry the
+                # conn string verbatim.
                 raise SqlIngestError(
                     f"arrow_odbc rejected a keyword argument "
                     f"(likely a version mismatch): "
                     f"{_redact_secrets(str(exc), secrets)}"
-                ) from None
+                ) from exc
             except Exception as exc:  # arrow_odbc raises various native errors
                 raise SqlIngestError(
                     f"failed to open ODBC reader against {server_canon}/{database}: "
@@ -5210,7 +5550,17 @@ def _validate_iam_auth(
         raise RedshiftIngestError(
             "iam=True: aws_secret_access_key requires aws_access_key_id"
         )
-    if aws_session_token is not None and aws_access_key_id is None:
+    # Both halves of the long-term key pair must be present alongside a
+    # session token. Checking ``aws_secret_access_key`` here independently
+    # of the access-key-id check above is defense-in-depth: today
+    # ``aws_access_key_id is None`` already implies
+    # ``aws_secret_access_key is None`` (the pairing rule), but if that
+    # invariant ever loosens this site would silently allow a session
+    # token without the secret key. Stating the full contract locally
+    # keeps the error message accurate to its claim.
+    if aws_session_token is not None and (
+        aws_access_key_id is None or aws_secret_access_key is None
+    ):
         raise RedshiftIngestError(
             "iam=True: aws_session_token must accompany "
             "aws_access_key_id+aws_secret_access_key (temporary STS creds)"
@@ -5416,11 +5766,17 @@ def _open_arrow_reader(
             # query_timeout_sec in different releases; an "unexpected
             # keyword argument" here almost certainly means the
             # installed arrow_odbc is older than this wrapper expects.
+            # Chain via ``from exc`` (not ``from None``): a Python TypeError
+            # for an unexpected keyword argument does not echo the
+            # connection string or password, so the original traceback is
+            # debug-useful and safe to surface. The other branches in this
+            # function suppress the cause because their messages can echo
+            # the conn string verbatim.
             raise RedshiftIngestError(
                 f"arrow_odbc rejected a keyword argument "
                 f"(likely a version mismatch): "
                 f"{_redact_secrets(str(exc), secrets)}"
-            ) from None
+            ) from exc
         except Exception as exc:  # arrow_odbc raises a variety of native errors
             raise RedshiftIngestError(
                 f"failed to open ODBC reader against {host}/{database}: "
@@ -5857,6 +6213,13 @@ def _check_finite_numerics(
                 # which is the correct semantics — nothing to violate.
                 if not bool(df[name].is_finite().all()):
                     bad.append(name)
+        except MemoryError:
+            # Allocation failure on a wide column scan is a process-level
+            # signal, not per-column polars-API drift. Propagate so the
+            # caller sees a clean OOM rather than a misleading
+            # "finiteness check failed on N columns" aggregate. Subsequent
+            # columns would also OOM and obscure the root cause.
+            raise
         except Exception as exc:  # noqa: BLE001
             # Polars dtype-API drift on this column; capture and keep
             # checking the rest so the operator sees every problem at

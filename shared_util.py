@@ -19,7 +19,7 @@ import uuid
 import zoneinfo
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path, PurePath
-from typing import Any, Literal, NamedTuple, Protocol, cast, overload
+from typing import Any, Literal, NamedTuple, Protocol, TypeVar, cast, overload
 
 import exchange_calendars as xcals  # type: ignore[import-untyped]
 import matplotlib.pyplot as plt
@@ -129,6 +129,374 @@ _FLOAT_DTYPE_CLASSES: tuple[type[pl.DataType], ...] = _build_dtype_tuple(
     "Float32", "Float64"
 )
 
+# Generous but finite upper bounds shared by the ODBC ingest paths
+# (sql_query, redshift_query) to catch typos without over-constraining.
+# 2 GiB covers both ODBC wide-buffer limits and SQL Server's per-value
+# MAX-type ceiling.
+_MAX_BATCH_SIZE = 10_000_000
+_MAX_TIMEOUT_SEC = 86_400  # 1 day; beyond this the caller almost certainly meant "no timeout"
+_MAX_ROWS_CAP = 10**12  # trillion-row hard ceiling on the caller-supplied max_rows
+_MAX_VALUE_BYTES = 2**31 - 1  # 2 GiB; ODBC wide-buffer / SQL Server MAX-type upper bound
+
+
+# ─── Shared NAS / SMB resilience primitives ───────────────────────────
+# These are used by every retry envelope in this module: the parquet
+# writer (save_results), the chart writer (save_matplotlib_charts_as_html),
+# and the parquet reader (lazy_parquet).  Defining them once here keeps
+# the transient-lock errno set, the chmod-on-EACCES recovery, and the
+# best-effort tmp-cleanup pattern from drifting between sites.
+
+# Safe errno access: these POSIX constants may be absent on some Windows
+# Python builds.  Using -1 as sentinel ensures they never accidentally
+# match a real errno value.
+_ESTALE: int = getattr(errno, "ESTALE", -1)  # NFS stale file handle
+_ETXTBSY: int = getattr(errno, "ETXTBSY", -1)  # Text file busy
+
+
+def _is_transient_lock(e: OSError) -> bool:
+    """Return True when ``e`` represents a transient NAS / SMB lock.
+
+    Covers WinError 5 (Access Denied), 32 (Sharing Violation), 33 (Lock
+    Violation) on Windows; EACCES, EBUSY, EAGAIN, ESTALE, ETXTBSY on
+    POSIX.  Used by every NAS-resilient retry envelope in this module.
+    """
+    win_err = getattr(e, "winerror", 0)
+    posix_err = getattr(e, "errno", 0)
+    return win_err in (5, 32, 33) or posix_err in (
+        errno.EACCES,
+        errno.EBUSY,
+        errno.EAGAIN,
+        _ESTALE,
+        _ETXTBSY,
+    )
+
+
+def _is_access_denied(e: OSError) -> bool:
+    """True when ``e`` is the cross-platform Access-Denied case.
+
+    Backup / compliance tools on Isilon set the read-only attribute on
+    both Windows (``WinError 5``) and Linux (``EACCES`` on NFS/SMB);
+    every NAS-mutation retry helper needs to detect this case to clear
+    the attribute before the next attempt.
+    """
+    return getattr(e, "winerror", 0) == 5 or getattr(e, "errno", 0) == errno.EACCES
+
+
+def _unlink_best_effort(path: str | Path) -> None:
+    """Unlink ``path`` if present; swallow ``OSError`` (best-effort cleanup).
+
+    Use only at sites where leaving the file in place is acceptable
+    (tmp-file cleanup paths, where a retry will overwrite anyway).
+    """
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
+
+
+def _clear_readonly_attr(path: Path) -> None:
+    """If ``path`` exists and is read-only, clear the attribute.
+
+    Best-effort: any error is swallowed because the next retry of the
+    surrounding NAS-mutation operation will surface the real error.
+    Used by the chmod-on-EACCES branches of ``_makedirs_with_retry``,
+    ``_fsync_and_verify_size``, and ``_atomic_replace``.
+    """
+    try:
+        attrs = path.stat().st_mode
+        if not (attrs & stat.S_IWRITE):
+            path.chmod(attrs | stat.S_IWRITE)
+    except OSError:
+        pass
+
+
+_RetryT = TypeVar("_RetryT")
+
+
+def _retry_on_transient_lock(
+    op: Callable[[], _RetryT], *, max_attempts: int = 12
+) -> _RetryT:
+    """Run ``op`` up to ``max_attempts`` times, retrying on transient
+    NAS / SMB locks (see ``_is_transient_lock``).  Backoff: 0.5s … 15s cap.
+
+    Non-transient ``OSError``\\s propagate immediately; the final
+    attempt's transient ``OSError`` also propagates so the caller sees a
+    real failure rather than a silent loop exit.  Sites needing
+    additional recovery (chmod-on-EACCES, partial-tmp cleanup) keep
+    their own bespoke loops; this helper is for the simple read-only
+    retry case shared by the parquet metadata helpers.
+    """
+    for attempt in range(max_attempts):
+        try:
+            return op()
+        except OSError as e:
+            if not _is_transient_lock(e):
+                raise
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(min(15.0, 0.5 * (2**attempt)))
+    raise AssertionError("unreachable")  # for-loop exits via return or raise
+
+# Characters that would let an attacker (or a malformed config value) escape
+# a DRIVER={...} / SERVER=... / DATABASE=... segment and inject arbitrary
+# ODBC connection-string keys.  Shared between sql_query and redshift_query.
+_CONN_STR_FORBIDDEN = (";", "{", "}", "\x00", "\n", "\r")
+
+
+class _BoundaryChecker:
+    """Boundary-validation helpers parameterized on the exception class.
+
+    ``sql_query`` and ``redshift_query`` share identical input-validation
+    semantics but raise different domain exception classes
+    (``SqlIngestError`` vs ``RedshiftIngestError``). One implementation,
+    two bindings — every helper here had a near-byte-identical twin in
+    each ingest section before consolidation; keeping the surfaces aligned
+    here is the single source of truth that keeps them from drifting.
+    """
+
+    __slots__ = ("error_cls",)
+
+    def __init__(self, error_cls: type[Exception]) -> None:
+        self.error_cls = error_cls
+
+    def conn_token(self, name: str, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise self.error_cls(
+                f"{name} must be a non-empty, non-whitespace str, got "
+                f"{type(value).__name__}={value!r}"
+            )
+        # Leading/trailing whitespace is silently tolerated by some ODBC
+        # driver managers and rejected by others; rather than silently
+        # strip (which would hide caller-side typos like copy-pasting
+        # from docs), reject at the boundary with an actionable message.
+        if value != value.strip():
+            raise self.error_cls(
+                f"{name} has leading/trailing whitespace: {value!r}. "
+                "Strip at the call site for consistent cross-platform behavior."
+            )
+        for ch in _CONN_STR_FORBIDDEN:
+            if ch in value:
+                raise self.error_cls(
+                    f"{name} contains forbidden character {ch!r}: {value!r}"
+                )
+        return value
+
+    @overload
+    def int_(
+        self,
+        name: str,
+        value: int | None,
+        *,
+        minv: int,
+        maxv: int,
+        allow_none: Literal[False] = ...,
+    ) -> int: ...
+
+    @overload
+    def int_(
+        self,
+        name: str,
+        value: int | None,
+        *,
+        minv: int,
+        maxv: int,
+        allow_none: Literal[True],
+    ) -> int | None: ...
+
+    def int_(
+        self,
+        name: str,
+        value: int | None,
+        *,
+        minv: int,
+        maxv: int,
+        allow_none: bool = False,
+    ) -> int | None:
+        if value is None:
+            if allow_none:
+                return None
+            raise self.error_cls(f"{name} must not be None")
+        # bool is an int subclass in Python; reject explicitly to prevent
+        # `port=True` silently meaning 1.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise self.error_cls(
+                f"{name} must be int, got {type(value).__name__}={value!r}"
+            )
+        if not (minv <= value <= maxv):
+            raise self.error_cls(
+                f"{name} must be in [{minv}, {maxv}], got {value}"
+            )
+        return value
+
+    def bool_(self, name: str, value: bool) -> None:
+        # Guard against truthy-string / int-1 sneaking in through kwargs.
+        if not isinstance(value, bool):
+            raise self.error_cls(
+                f"{name} must be bool, got {type(value).__name__}={value!r}"
+            )
+
+    def optional_bool(self, name: str, value: bool | None) -> None:
+        if value is None:
+            return
+        self.bool_(name, value)
+
+    def optional_str(
+        self, name: str, value: str | None, *, sensitive: bool = False
+    ) -> None:
+        if value is not None and not isinstance(value, str):
+            # For credential-bearing fields, never echo the rejected value:
+            # a bytes-wrapped password (e.g. reading from stdin without
+            # decoding) would otherwise be printed verbatim into logs.
+            shown = "<redacted>" if sensitive else repr(value)
+            raise self.error_cls(
+                f"{name} must be str or None, got {type(value).__name__}={shown}"
+            )
+
+    def no_control_chars(self, name: str, value: str) -> None:
+        """Reject NUL / LF / CR inside a credential or similar token.
+
+        These are almost always artifacts of reading the value from
+        stdin or from a text file without stripping the trailing
+        newline, and the downstream ODBC error message differs by
+        platform, so catch them at our boundary with an actionable
+        message.
+        """
+        for bad in ("\x00", "\n", "\r"):
+            if bad in value:
+                raise self.error_cls(
+                    f"{name} contains a control character {bad!r}; commonly "
+                    "seen when reading credentials from stdin or a file "
+                    "without stripping a trailing newline"
+                )
+
+    def list_or_tuple(self, name: str, value: object) -> None:
+        """Require a ``list`` / ``tuple`` where a caller-ordered sequence is expected.
+
+        ``Sequence[str]`` in the annotation is enforcement-free at
+        runtime; three distinct traps would otherwise silently produce
+        wrong results:
+
+        * ``str`` / ``bytes`` / ``bytearray`` are Sequences but iterate
+          character-by-character: ``parameters="?"`` silently becomes
+          a single-char sequence instead of ``["?"]``.
+        * ``set`` / ``frozenset`` are not Sequences but ``list(s)``
+          still works; iteration order is not a caller contract,
+          which scrambles positional ODBC binding without error.
+        * ``dict`` iterates keys only (values dropped) in insertion
+          order — not what a caller passing a mapping expects.
+
+        Accepting only ``list`` / ``tuple`` makes the caller contract
+        explicit and deterministic.
+        """
+        if isinstance(value, (list, tuple)):
+            return
+        if isinstance(value, (str, bytes, bytearray)):
+            reason = (
+                "a bare string/bytes value would be iterated "
+                "character-by-character"
+            )
+        elif isinstance(value, (set, frozenset, dict)):
+            reason = (
+                "unordered/mapping types iterate in a non-caller-controlled "
+                "order and would silently scramble positional binding"
+            )
+        else:
+            reason = (
+                "only list/tuple carry a deterministic, caller-defined order"
+            )
+        raise self.error_cls(
+            f"{name} must be a list or tuple, not {type(value).__name__}: "
+            f"{reason}. Wrap in a list: {name}=[value] (or list(value))."
+        )
+
+    @staticmethod
+    def find_duplicates(names: Sequence[str]) -> list[str]:
+        # Companion ``dupes_seen`` set keeps dedup-of-dupes O(1); without
+        # it ``n not in dupes`` would degrade to O(n^2) on a pathological
+        # multi-thousand-column result.
+        seen: set[str] = set()
+        dupes_seen: set[str] = set()
+        dupes: list[str] = []
+        for n in names:
+            if n in seen and n not in dupes_seen:
+                dupes.append(n)
+                dupes_seen.add(n)
+            seen.add(n)
+        return sorted(dupes)
+
+    def finite_numerics(self, df: pl.DataFrame, *, require: bool) -> None:
+        """Reject NULL / NaN / ±Inf in numeric columns when ``require=True``.
+
+        Implements CLAUDE.md inbound boundary contract item 4
+        ("Finiteness").  For Int/UInt/Decimal columns we reject only
+        NULL (those types cannot represent NaN/Inf).  For Float32/Float64
+        we additionally reject NaN / +Inf / -Inf via ``is_finite``.
+        Defaults off because NULL is a documented expectation in many
+        upstream tables (per CLAUDE.md's "except where NaN is documented
+        as expected"); enable only for tables where NULL/NaN indicates
+        upstream corruption.
+
+        Polars-call exceptions are wrapped to the bound exception class
+        to keep the wrapper's "all failures surface as that class"
+        contract intact across dtype-API drift between polars releases.
+        The loop does NOT abort on the first polars-side exception:
+        data violations on other columns are still collected and
+        surfaced, with the API-error column listed alongside — fail-
+        loud with one message that names every offending column rather
+        than the first one we tripped over.
+        """
+        if not require:
+            return
+        bad: list[str] = []
+        api_errors: list[tuple[str, Exception]] = []
+        for name, dtype in df.schema.items():
+            if not isinstance(dtype, _NUMERIC_DTYPE_CLASSES):
+                continue
+            try:
+                if df[name].null_count() > 0:
+                    bad.append(name)
+                    continue
+                if isinstance(dtype, _FLOAT_DTYPE_CLASSES):
+                    # ``is_finite`` returns False for NaN / +Inf / -Inf.
+                    # On an empty Series ``.all()`` returns True (vacuous),
+                    # which is the correct semantics — nothing to violate.
+                    if not bool(df[name].is_finite().all()):
+                        bad.append(name)
+            except MemoryError:
+                # Allocation failure on a wide column scan is a process-
+                # level signal, not per-column polars-API drift.
+                # Propagate so the caller sees a clean OOM rather than
+                # the misleading "finiteness check failed on N columns"
+                # aggregate.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # Polars dtype-API drift on this column; capture and
+                # keep checking the rest so the operator sees every
+                # problem at once.
+                api_errors.append((name, exc))
+        if bad:
+            msg = (
+                "require_finite_numerics=True but numeric columns contain "
+                f"NULL / NaN / Inf: {bad}"
+            )
+            if api_errors:
+                err_cols = [n for n, _ in api_errors]
+                msg += (
+                    " (additionally, the check could not be evaluated on "
+                    f"columns: {err_cols})"
+                )
+            raise self.error_cls(msg)
+        if api_errors:
+            # ``api_err`` rather than ``exc`` because Python 3 implicitly
+            # ``del exc`` at the end of an ``except ... as exc`` block
+            # (PEP 3134); re-binding the same name outside the except
+            # confuses mypy under ``--strict``.
+            bad_name, api_err = api_errors[0]
+            raise self.error_cls(
+                f"finiteness check failed on column {bad_name!r}: "
+                f"{type(api_err).__name__}: {api_err}"
+            ) from api_err
+
 #################################################################################################
 # Parse command line arguments (or use defaults in interactive mode), validate all inputs,
 # and resolve the write directory path.
@@ -161,7 +529,7 @@ def parse_arguments(
     # ``dev_folder=Path(...)`` instead of str, or a typo'd
     # ``default_write_mode``) surfaces as a cryptic ``strftime`` /
     # ``AttributeError`` deep in the function. Match the inbound-boundary
-    # discipline used by ``_validate_inputs`` and the ``_sql_check_*``
+    # discipline used by ``_validate_inputs`` and the ``_BoundaryChecker``
     # helpers: fail fast with a descriptive ``TypeError`` / ``ValueError``.
     #
     # ``isinstance(..., datetime.date)`` accepts ``datetime.datetime`` (a
@@ -688,86 +1056,68 @@ def _mtd_should_include_today(
     if not is_target_session(today):
         return False
     try:
+        # Per-venue try/except (not a list-comp): a list-comp would
+        # short-circuit on the first exception and silently drop
+        # subsequent venues' errors — making a multi-venue library
+        # regression look like a single-venue blip.  Both branches
+        # below need the full per-venue (closes, errors, none) trio so
+        # they can log accurately.
+        closes: list[Any] = []
+        close_errors: list[BaseException] = []
+        has_none = False
+        for c in cals:
+            try:
+                cl = c.session_close(today)
+            except Exception as e:
+                close_errors.append(e)
+                continue
+            if cl is None:
+                has_none = True
+                continue
+            closes.append(cl)
+
+        last_err_repr = (
+            f"{type(close_errors[-1]).__name__}: {close_errors[-1]!s}"
+            if close_errors
+            else "no-exception"
+        )
         if combine_type == "intersect":
-            # Per-venue try/except mirrors the union branch below so every
-            # venue's session_close error is captured (a list-comprehension
-            # would short-circuit on the first exception and silently drop
-            # subsequent venues' errors — making a multi-venue library
-            # regression look like a single-venue blip).
-            #
             # Invariant: is_target_session(today)==True under intersect
-            # means every venue reports today as a session, so every venue
-            # MUST yield a concrete (non-None, non-raising) close. Any
-            # deviation (exception, None) is a library-inconsistency
-            # signal; we conservatively exclude today and surface the
-            # diagnostic via _mtd_safe_log_warning — same posture as the
-            # union branch's "zero concrete closes" log.
-            intersect_closes: list[Any] = []
-            intersect_close_errors: list[BaseException] = []
-            intersect_has_none = False
-            for c in cals:
-                try:
-                    cl = c.session_close(today)
-                except Exception as e:
-                    intersect_close_errors.append(e)
-                    continue
-                if cl is None:
-                    intersect_has_none = True
-                    continue
-                intersect_closes.append(cl)
-            if intersect_close_errors or intersect_has_none:
+            # means every venue reports today as a session, so every
+            # venue MUST yield a concrete (non-None, non-raising) close.
+            # Any deviation is a library-inconsistency signal; we
+            # conservatively exclude today and surface the diagnostic.
+            if close_errors or has_none:
                 _mtd_safe_log_warning(
                     "compute_mtd_date_range: intersect today-inclusion "
                     "found is_target_session(today)=True but not every "
                     "venue yielded a concrete close (venues=%s, today=%s, "
                     "close_errors=%d, none_closes=%s, last_error=%s)",
-                    unique_venues, today, len(intersect_close_errors),
-                    intersect_has_none,
-                    (f"{type(intersect_close_errors[-1]).__name__}: "
-                     f"{intersect_close_errors[-1]!s}"
-                     if intersect_close_errors else "no-exception"),
+                    unique_venues, today, len(close_errors),
+                    has_none, last_err_repr,
                 )
                 return False
-            # intersect_closes is non-empty here: cals is non-empty by
-            # construction (_mtd_load_calendars_and_tz guards) and every
-            # venue yielded a concrete close (the error/None guard above
-            # would have early-returned otherwise), so max() is safe.
-            latest_close = max(intersect_closes)
-            # bool(numpy.bool_) → Python bool (fine).
-            # bool(pd.NaT) → TypeError → caught below.
-            # Plain datetime comparison → Python bool.
-            return bool(now_local >= latest_close)
-        # union
-        union_closes: list[Any] = []
-        union_close_errors: list[BaseException] = []
-        for c in cals:
-            try:
-                cl = c.session_close(today)
-            except Exception as e:
-                # Venue doesn't have today as a session (OOB or non-
-                # trading day) — it doesn't contribute. Capture for
-                # the post-loop library-fault check below.
-                union_close_errors.append(e)
-                continue
-            if cl is not None:
-                union_closes.append(cl)
-        if not union_closes:
-            # is_target_session(today) was True (at least one venue
-            # reports today as a session), but no venue yielded a
-            # concrete close — library inconsistency. Surface the last
-            # per-cal error so operators don't silently stale-date
-            # every run when e.g. session_close regresses library-wide.
-            _mtd_safe_log_warning(
-                "compute_mtd_date_range: union today-inclusion found "
-                "is_target_session(today)=True but zero concrete closes "
-                "(venues=%s, today=%s, close_errors=%d, last=%s)",
-                unique_venues, today, len(union_close_errors),
-                (f"{type(union_close_errors[-1]).__name__}: "
-                 f"{union_close_errors[-1]!s}"
-                 if union_close_errors else "no-exception"),
-            )
-            return False
-        latest_close = max(union_closes)
+        else:  # union
+            # Only the trading subset contributes — OOB venues legitimately
+            # raise or return None.  Require at least one concrete close;
+            # zero is a library-inconsistency signal.
+            if not closes:
+                _mtd_safe_log_warning(
+                    "compute_mtd_date_range: union today-inclusion found "
+                    "is_target_session(today)=True but zero concrete closes "
+                    "(venues=%s, today=%s, close_errors=%d, last=%s)",
+                    unique_venues, today, len(close_errors), last_err_repr,
+                )
+                return False
+
+        # ``closes`` is non-empty here: under intersect every venue yielded
+        # a concrete close (else the early-return above fired); under
+        # union the ``not closes`` guard caught the empty case.  So
+        # max() is safe.
+        # bool(numpy.bool_) → Python bool (fine).
+        # bool(pd.NaT) → TypeError → caught below.
+        # Plain datetime comparison → Python bool.
+        latest_close = max(closes)
         return bool(now_local >= latest_close)
     except Exception as e:
         # session_close / max / comparison / bool-coerce failure → be
@@ -1226,89 +1576,38 @@ def lazy_parquet(
     # Read schemas and check compatibility before concatenating.
     # On a shared NAS, files can vanish between listdir and schema read
     # (e.g. concurrent save_results deleting old date-range files) — those
-    # skip silently.  But transient AV/DLP/SMB locks (WinError 5/32/33,
-    # EACCES/EBUSY/EAGAIN/ESTALE/ETXTBSY) must NOT be treated as "vanished":
+    # skip silently.  But transient AV/DLP/SMB locks (see
+    # ``_is_transient_lock``) must NOT be treated as "vanished":
     # swallowing them would drop a valid partition and silently under-count
-    # rows downstream.  Mirror the save_results retry envelope: 12× with
-    # 0.5s → 15s backoff; after that, raise loudly.
-    def _is_transient_lock(e: OSError) -> bool:
-        win_err = getattr(e, "winerror", 0)
-        posix_err = getattr(e, "errno", 0)
-        return win_err in (5, 32, 33) or posix_err in (
-            errno.EACCES,
-            errno.EBUSY,
-            errno.EAGAIN,
-            _ESTALE,
-            _ETXTBSY,
-        )
-
+    # rows downstream.  Mirror the save_results retry envelope (12×, 0.5s
+    # → 15s backoff) via ``_retry_on_transient_lock``; after exhaustion,
+    # raise loudly.  ENOENT is NOT silently skipped: in the date-range-
+    # filename pattern used by save_results, a concurrently-deleted file
+    # implies a replacement file now exists that our stale iterdir
+    # snapshot did not see — silent skip would leave a hole.
     def _read_schema_with_retry(path: str) -> dict[str, pl.DataType]:
-        """Return schema.  Raises on any failure after exhausting retries.
-
-        ENOENT is NOT silently skipped: in the date-range-filename pattern
-        used by save_results, a concurrently-deleted file implies a
-        replacement file now exists that our stale iterdir snapshot did
-        not see.  Skipping the vanished file would leave a silent hole in
-        the dataset.  Raise and let the caller retry the whole load.
-        """
-        for _attempt in range(12):
-            try:
-                return pl.read_parquet_schema(path)
-            except OSError as e:
-                if not _is_transient_lock(e):
-                    raise
-                if _attempt == 11:
-                    raise
-                time.sleep(min(15.0, 0.5 * (2**_attempt)))
-        raise AssertionError("unreachable")  # loop exits via return or raise
+        return _retry_on_transient_lock(lambda: pl.read_parquet_schema(path))
 
     def _scan_with_retry(path: str) -> pl.LazyFrame:
-        """Build the lazy scan.  Raises on any failure after retries.
-
-        Same rationale as _read_schema_with_retry: ENOENT is not skipped
-        because the date-range-filename pattern means a vanished file
-        implies an unseen replacement.  Fail loud and let the caller retry.
-        """
-        for _attempt in range(12):
-            try:
-                return pl.scan_parquet(path)
-            except OSError as e:
-                if not _is_transient_lock(e):
-                    raise
-                if _attempt == 11:
-                    raise
-                time.sleep(min(15.0, 0.5 * (2**_attempt)))
-        raise AssertionError("unreachable")
+        return _retry_on_transient_lock(lambda: pl.scan_parquet(path))
 
     def _null_count_with_retry(path: str, col: str) -> int:
-        """Return null count of ``col`` in ``path``, retried on transient NAS locks.
-
-        Uses parquet column statistics when present (Polars' own
-        ``write_parquet`` embeds them by default), so this is near-zero I/O
-        for files we produce.  Third-party writers without stats fall back
-        to a full column scan — still bounded to one column and cheaper
-        than a full-frame materialize.
-
-        Non-OSError failures (ComputeError from a corrupt file, PanicException
-        from a version regression) propagate: a corrupt file is an inbound-
-        boundary violation and must halt the load, mirroring the fail-loud
-        posture of _read_schema_with_retry.
-        """
-        for _attempt in range(12):
-            try:
-                return int(
-                    pl.scan_parquet(path)
-                    .select(pl.col(col).null_count().alias("__lp_nullcount"))
-                    .collect()
-                    .item()
-                )
-            except OSError as e:
-                if not _is_transient_lock(e):
-                    raise
-                if _attempt == 11:
-                    raise
-                time.sleep(min(15.0, 0.5 * (2**_attempt)))
-        raise AssertionError("unreachable")
+        # Uses parquet column statistics when present (Polars'
+        # ``write_parquet`` embeds them by default), so this is near-zero
+        # I/O for files we produce.  Third-party writers without stats
+        # fall back to a full column scan — still bounded to one column
+        # and cheaper than a full-frame materialize.  Non-OSError
+        # failures (ComputeError from a corrupt file, PanicException
+        # from a version regression) propagate as inbound-boundary
+        # violations.
+        return _retry_on_transient_lock(
+            lambda: int(
+                pl.scan_parquet(path)
+                .select(pl.col(col).null_count().alias("__lp_nullcount"))
+                .collect()
+                .item()
+            )
+        )
 
     # Sort alphabetically to guarantee chronological chunk ordering.
     # Since files are named via zero-padded ranges (e.g. prefix-202001-202012.parquet),
@@ -2371,73 +2670,7 @@ def save_matplotlib_charts_as_html(
                 f"figures[{i}] is {type(fig).__name__}, expected matplotlib Figure"
             )
 
-    # Type checks before string-level checks so a non-str input fails
-    # with a clear message instead of a cryptic ``AttributeError`` from
-    # ``42.strip()`` further down. Mirrors ``_validate_inputs``.
-    if not isinstance(write_directory, str):
-        raise TypeError(
-            f"write_directory must be a str, got {type(write_directory).__name__}"
-        )
-    if not isinstance(subfolder, str):
-        raise TypeError(
-            f"subfolder must be a str, got {type(subfolder).__name__}"
-        )
-    if not isinstance(file_name_prefix, str):
-        raise TypeError(
-            f"file_name_prefix must be a str, got "
-            f"{type(file_name_prefix).__name__}"
-        )
-
-    # Reuse the same string-level checks that save_results applies
-    if not write_directory or not write_directory.strip():
-        raise ValueError("write_directory must not be empty or whitespace")
-    if not Path(write_directory).is_dir():
-        raise ValueError(f"write_directory does not exist: {write_directory}")
-
-    if not subfolder or not subfolder.strip():
-        raise ValueError("subfolder must not be empty or whitespace")
-    _subfolder_parts = subfolder.replace("\\", "/").split("/")
-    for _part in _subfolder_parts:
-        if _part and _part != _part.strip():
-            raise ValueError(
-                f"subfolder components must not have leading/trailing whitespace: {subfolder!r}"
-            )
-        if _part and _WINDOWS_ILLEGAL_CHARS.search(_part):
-            raise ValueError(
-                f"subfolder contains characters illegal in Windows paths: {subfolder!r}"
-            )
-        if _part and _WINDOWS_RESERVED_NAMES.match(_part.split(".")[0]):
-            raise ValueError(
-                f"subfolder contains reserved Windows device name: {_part!r}"
-            )
-    if not any(_subfolder_parts):
-        raise ValueError(
-            f"subfolder must contain at least one non-empty path component: {subfolder!r}"
-        )
-
-    # Explicit check for both separators rather than os.path.basename(), which
-    # only treats "\" as a separator on Windows.  This ensures identical
-    # validation behaviour on both Windows and Linux.
-    if (
-        not file_name_prefix
-        or file_name_prefix != file_name_prefix.strip()
-        or "/" in file_name_prefix
-        or "\\" in file_name_prefix
-    ):
-        raise ValueError(
-            "file_name_prefix must not be empty, cannot have leading/trailing "
-            "whitespace, and cannot contain path separators"
-        )
-    if _WINDOWS_ILLEGAL_CHARS.search(file_name_prefix):
-        raise ValueError(
-            f"file_name_prefix contains characters illegal in Windows filenames: "
-            f"{file_name_prefix!r}"
-        )
-    if _WINDOWS_RESERVED_NAMES.match(file_name_prefix.split(".")[0]):
-        raise ValueError(
-            f"file_name_prefix uses a reserved Windows device name: {file_name_prefix!r}"
-        )
-    _reject_dot_only_basename(file_name_prefix, field="file_name_prefix")
+    _validate_path_components(write_directory, subfolder, file_name_prefix)
 
     # ── Step 2: Resolve folder path with traversal check ────────────────
     folder_path = _resolve_folder_path(write_directory, subfolder)
@@ -2574,11 +2807,7 @@ def save_matplotlib_charts_as_html(
 
     except BaseException:
         if not rename_done:
-            # Best-effort cleanup of partial temp file
-            try:
-                Path(tmp_path).unlink()
-            except OSError:
-                pass  # Temp file may not exist if os.open failed
+            _unlink_best_effort(tmp_path)
         raise
 
     action = "updated" if pre_existed else "saved"
@@ -2636,12 +2865,6 @@ def _reject_dot_only_basename(name: str, *, field: str) -> None:
             "resulting filename (e.g. '..parquet') is operationally "
             "ambiguous. Use a name with at least one non-dot character."
         )
-
-## Safe errno access: these POSIX constants may be absent on some Windows Python builds.
-## Using -1 as sentinel ensures they never accidentally match a real errno value.
-_ESTALE: int = getattr(errno, "ESTALE", -1)  # NFS stale file handle
-_ETXTBSY: int = getattr(errno, "ETXTBSY", -1)  # Text file busy
-
 
 ## IANA tz database lookup for report timestamps.  Linux distros ship the
 ## tzdb system-wide, but Windows does not — stdlib ``zoneinfo`` on Windows
@@ -2720,10 +2943,9 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
             # Always attempt to remove the probe; if it fails, orphaned probes
             # are cleaned up below as part of the regular stale-file sweep.
             if probe_created:
-                try:
-                    Path(probe_path).unlink()
-                except OSError:
-                    pass  # Orphaned probe cleaned up by the stale-file sweep below
+                # Orphaned probe (if any) is cleaned up by the
+                # stale-file sweep below — see _MAX_PROBE_AGE.
+                _unlink_best_effort(probe_path)
 
         # --- Sweep the folder for stale temp files and orphaned time probes ---
         # Use ``casefold()`` for the extension and prefix tests so that on
@@ -2791,26 +3013,18 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
         pass  # Entire cleanup is best-effort; never block the caller
 
 
-def _validate_inputs(
-    dataframe: pl.DataFrame, write_directory: str, subfolder: str, file_name_prefix: str
+def _validate_path_components(
+    write_directory: str, subfolder: str, file_name_prefix: str
 ) -> None:
-    """Validate all inputs before attempting to save.
+    """Validate the (write_directory, subfolder, file_name_prefix) tuple
+    shared by ``save_results`` and ``save_matplotlib_charts_as_html``.
 
-    Raises ValueError / TypeError with a descriptive message for any input
-    that would cause a confusing downstream failure (empty DataFrame, bad
-    path characters, whitespace in components, etc.).
+    Type-checks each as ``str`` at the boundary, then runs the cross-
+    platform path-shape rules: whitespace, illegal chars, reserved
+    device names, and ``.``/``..`` components per part.  Single source
+    of truth so the two output pipelines cannot drift in their accepted
+    path shapes.
     """
-    # Fail fast on LazyFrames: pl.LazyFrame has no .is_empty(), so passing one
-    # would throw a cryptic AttributeError instead of a clear type error.
-    if not isinstance(dataframe, pl.DataFrame):
-        raise TypeError(
-            f"Expected eager polars.DataFrame, got {type(dataframe).__name__}. "
-            f"Call .collect() first."
-        )
-
-    if dataframe.is_empty():
-        raise ValueError("Cannot save an empty DataFrame")
-
     # --- type checks: catch non-str inputs at the boundary instead of
     # letting ``not value or not value.strip()`` raise a cryptic
     # ``AttributeError`` (e.g. ``42.strip()``) further down.
@@ -2890,6 +3104,29 @@ def _validate_inputs(
             f"file_name_prefix uses a reserved Windows device name: {file_name_prefix!r}"
         )
     _reject_dot_only_basename(file_name_prefix, field="file_name_prefix")
+
+
+def _validate_inputs(
+    dataframe: pl.DataFrame, write_directory: str, subfolder: str, file_name_prefix: str
+) -> None:
+    """Validate all inputs before attempting to save.
+
+    Raises ValueError / TypeError with a descriptive message for any input
+    that would cause a confusing downstream failure (empty DataFrame, bad
+    path characters, whitespace in components, etc.).
+    """
+    # Fail fast on LazyFrames: pl.LazyFrame has no .is_empty(), so passing one
+    # would throw a cryptic AttributeError instead of a clear type error.
+    if not isinstance(dataframe, pl.DataFrame):
+        raise TypeError(
+            f"Expected eager polars.DataFrame, got {type(dataframe).__name__}. "
+            f"Call .collect() first."
+        )
+
+    if dataframe.is_empty():
+        raise ValueError("Cannot save an empty DataFrame")
+
+    _validate_path_components(write_directory, subfolder, file_name_prefix)
 
     # NOTE: Basename byte-length and Windows MAX_PATH checks are performed in
     # save_results() AFTER _build_filename() generates the exact filenames.
@@ -3177,15 +3414,7 @@ def _makedirs_with_retry(folder_path: str) -> None:
             target.mkdir(parents=True, exist_ok=True)
             return
         except OSError as e:
-            win_err = getattr(e, "winerror", 0)
-            posix_err = getattr(e, "errno", 0)
-            if win_err not in (5, 32, 33) and posix_err not in (
-                errno.EACCES,
-                errno.EBUSY,
-                errno.EAGAIN,
-                _ESTALE,
-                _ETXTBSY,
-            ):
+            if not _is_transient_lock(e):
                 raise  # Not a transient NAS/permission error — fail fast
             if _mkdir_attempt == 11:
                 raise  # Exhausted all retries
@@ -3197,7 +3426,7 @@ def _makedirs_with_retry(folder_path: str) -> None:
             # marks a freshly created subfolder read-only between our
             # mkdir attempts).  Bound the walk at the filesystem root so
             # a pathologically deep symlink loop cannot spin forever.
-            if win_err == 5 or posix_err == errno.EACCES:
+            if _is_access_denied(e):
                 ancestor = target
                 _walk_limit = 64
                 while _walk_limit > 0 and not ancestor.exists():
@@ -3207,12 +3436,7 @@ def _makedirs_with_retry(folder_path: str) -> None:
                     ancestor = parent
                     _walk_limit -= 1
                 if ancestor.exists():
-                    try:
-                        attrs = ancestor.stat().st_mode
-                        if not (attrs & stat.S_IWRITE):
-                            ancestor.chmod(attrs | stat.S_IWRITE)
-                    except OSError:
-                        pass  # Best-effort chmod; next retry surfaces the real error
+                    _clear_readonly_attr(ancestor)
             time.sleep(min(15.0, 0.5 * (2**_mkdir_attempt)))  # Backoff: 0.5s … 15s cap
 
 
@@ -3253,44 +3477,21 @@ def _fsync_and_verify_size(tmp_path: str) -> int:
                 os.close(fd)
             break  # fsync succeeded
         except OSError as e:
-            win_err = getattr(e, "winerror", 0)
-            posix_err = getattr(e, "errno", 0)
             # Clear read-only attribute if a NAS compliance/DLP tool set it.
-            if win_err == 5 or posix_err == errno.EACCES:
-                try:
-                    tmp_p = Path(tmp_path)
-                    attrs = tmp_p.stat().st_mode
-                    if not (attrs & stat.S_IWRITE):
-                        tmp_p.chmod(attrs | stat.S_IWRITE)
-                except OSError:
-                    pass  # Best-effort chmod; next retry will surface the real error
-            if win_err not in (5, 32, 33) and posix_err not in (
-                errno.EACCES,
-                errno.EBUSY,
-                errno.EAGAIN,
-                _ESTALE,
-                _ETXTBSY,
-            ):
+            if _is_access_denied(e):
+                _clear_readonly_attr(Path(tmp_path))
+            if not _is_transient_lock(e):
                 # Not a transient lock — clean up partial tmp and propagate.
-                try:
-                    Path(tmp_path).unlink()
-                except OSError:
-                    pass  # Best-effort cleanup; tmp may already be gone
+                _unlink_best_effort(tmp_path)
                 raise
             if _fsync_attempt == 11:
                 # Exhausted all retries — clean up partial tmp and propagate.
-                try:
-                    Path(tmp_path).unlink()
-                except OSError:
-                    pass  # Best-effort cleanup; tmp may already be gone
+                _unlink_best_effort(tmp_path)
                 raise
             time.sleep(min(15.0, 0.5 * (2**_fsync_attempt)))  # Backoff: 0.5s … 15s cap
 
     if tmp_size <= 0:
-        try:
-            Path(tmp_path).unlink()
-        except OSError:
-            pass  # Best-effort cleanup; tmp may already be gone
+        _unlink_best_effort(tmp_path)
         raise OSError(
             f"fsync produced a zero-byte or unmeasured file: {tmp_path}"
         )
@@ -3348,21 +3549,16 @@ def _write_and_fsync(dataframe: pl.DataFrame, tmp_path: str) -> int:
             dataframe.write_parquet(tmp_path)
             break
         except OSError:
-            # Remove corrupted partial file before retrying.
-            try:
-                Path(tmp_path).unlink()
-            except OSError:
-                pass  # File may not have been created yet; ignore
+            # Remove corrupted partial file before retrying — parquet
+            # is not appendable, so each retry must start clean.
+            _unlink_best_effort(tmp_path)
             if _write_attempt == 3:
                 raise  # Exhausted all retries
             time.sleep(min(15.0, 1.0 * (2**_write_attempt)))  # Backoff: 1s, 2s, 4s
         except Exception as e:
             # Broad catch for non-OSError polars/arrow errors — never
             # swallowed, always re-raised with context per CLAUDE.md.
-            try:
-                Path(tmp_path).unlink()
-            except OSError:
-                pass  # Best-effort cleanup; tmp may not exist yet
+            _unlink_best_effort(tmp_path)
             raise RuntimeError(
                 f"_write_and_fsync: polars write_parquet failed "
                 f"(tmp_path={tmp_path!r}, n_rows={dataframe.height}, "
@@ -3431,10 +3627,7 @@ def _write_bytes_and_fsync(data: bytes | bytearray | memoryview, tmp_path: str) 
             break  # Write succeeded
         except OSError:
             # Remove partial tmp file before retrying.
-            try:
-                Path(tmp_path).unlink()
-            except OSError:
-                pass  # Best-effort cleanup; tmp may not exist yet
+            _unlink_best_effort(tmp_path)
             if _write_attempt == 3:
                 raise  # Exhausted write retries
             time.sleep(min(15.0, 1.0 * (2**_write_attempt)))  # Backoff: 1s, 2s, 4s
@@ -3445,10 +3638,7 @@ def _write_bytes_and_fsync(data: bytes | bytearray | memoryview, tmp_path: str) 
 
     # Size verification against caller-provided expectation.
     if tmp_size != expected_size:
-        try:
-            Path(tmp_path).unlink()
-        except OSError:
-            pass  # Best-effort cleanup; tmp may already be gone
+        _unlink_best_effort(tmp_path)
         raise OSError(
             f"Post-write size mismatch: expected {expected_size} bytes, "
             f"got {tmp_size} bytes for {tmp_path}"
@@ -3496,15 +3686,7 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
                 pass
             return
         except OSError as e:
-            win_err = getattr(e, "winerror", 0)
-            posix_err = getattr(e, "errno", 0)
-            if win_err not in (5, 32, 33) and posix_err not in (
-                errno.EACCES,
-                errno.EBUSY,
-                errno.EAGAIN,
-                _ESTALE,
-                _ETXTBSY,
-            ):
+            if not _is_transient_lock(e):
                 raise
             if _attempt == 11:
                 raise  # Exhausted all retries
@@ -3512,13 +3694,8 @@ def _atomic_replace(tmp_path: str, file_path: str) -> None:
             # Backup/compliance tools on Isilon may set this attribute
             # on both Windows (WinError 5) and Linux (EACCES on NFS/SMB).
             # Clear it before the next retry so Path.replace can overwrite.
-            if (win_err == 5 or posix_err == errno.EACCES) and file_p.is_file():
-                try:
-                    attrs = file_p.stat().st_mode
-                    if not (attrs & stat.S_IWRITE):
-                        file_p.chmod(attrs | stat.S_IWRITE)
-                except OSError:
-                    pass  # Best-effort chmod; next retry will surface the real error
+            if _is_access_denied(e) and file_p.is_file():
+                _clear_readonly_attr(file_p)
             time.sleep(min(15.0, 0.5 * (2**_attempt)))  # Backoff: 0.5s … 15s cap
 
 
@@ -3633,15 +3810,7 @@ def _verify_written_size(file_path: str, expected_size: int) -> None:
             # retry; if it persists to the end of the loop, the post-loop
             # branch will raise (0 < expected_size).
         except OSError as e:
-            win_err = getattr(e, "winerror", 0)
-            posix_err = getattr(e, "errno", 0)
-            if win_err not in (5, 32, 33) and posix_err not in (
-                errno.EACCES,
-                errno.EBUSY,
-                errno.EAGAIN,
-                _ESTALE,
-                _ETXTBSY,
-            ):
+            if not _is_transient_lock(e):
                 raise  # Non-transient — surface the real error immediately
             if _verify_attempt == 11:
                 raise  # Exhausted retries on a sustained transient lock
@@ -3916,10 +4085,8 @@ def save_results(
         # We only attempt removal when rename_done is False (write failed,
         # lock timed out, or verification failed before rename).
         if not rename_done:
-            try:
-                Path(tmp_path).unlink()
-            except OSError:
-                pass  # tmp may already be gone or still locked; stale cleanup handles it
+            # tmp may already be gone or still locked; stale cleanup handles it
+            _unlink_best_effort(tmp_path)
 
     elapsed = (time.monotonic() - start_time) / 60
     action = "updated" if will_overwrite else "saved"
@@ -3937,22 +4104,17 @@ def save_results(
 class SqlIngestError(RuntimeError):
     """Boundary-contract failure while ingesting from SQL Server."""
 
-# Characters that would let an attacker (or a malformed config value) escape
-# a DRIVER={...} / SERVER=... / DATABASE=... segment and inject arbitrary
-# ODBC connection-string keys.
-_SQL_CONN_STR_FORBIDDEN = (";", "{", "}", "\x00", "\n", "\r")
 
-# Generous but finite upper bounds to catch typos without over-constraining.
-_SQL_MAX_BATCH_SIZE = 10_000_000
-_SQL_MAX_TIMEOUT_SEC = 86_400  # 1 day; beyond this the caller almost certainly meant "no timeout"
-_SQL_MAX_ROWS_CAP = 10**12  # trillion-row hard ceiling on the caller-supplied max_rows
-_SQL_MAX_VALUE_BYTES = 2**31 - 1  # 2 GiB; SQL Server's per-value MAX-type upper bound
+# Boundary validators bound to ``SqlIngestError``.  See ``_BoundaryChecker``
+# at module top — one implementation, parameterized on the exception class.
+_sql_check = _BoundaryChecker(SqlIngestError)
+
 
 # Whitelist of `Authentication=...` values accepted by the Microsoft SQL
 # ODBC driver. A whitelist (not free-form str) is required because this
 # value is interpolated into the connection string; allowing arbitrary
 # text would reopen the conn-string injection surface we lock down with
-# _SQL_CONN_STR_FORBIDDEN.
+# _CONN_STR_FORBIDDEN.
 _SQL_AUTH_REQUIRES_CREDS = frozenset(
     {
         "ActiveDirectoryPassword",
@@ -3969,136 +4131,6 @@ _SQL_AUTH_NO_CREDS = frozenset(
     }
 )
 _SQL_AUTHENTICATION_VALUES = _SQL_AUTH_REQUIRES_CREDS | _SQL_AUTH_NO_CREDS
-
-
-# All SQL-Server helpers below are namespaced with _sql_ to prevent silent
-# shadowing by the Redshift section's identically-named helpers (which are
-# defined later in this module and would otherwise be resolved at call
-# time via Python's late-binding module-globals lookup, causing
-# ``sql_query`` to raise ``RedshiftIngestError`` instead of the
-# ``SqlIngestError`` its docstring promises).
-def _sql_check_conn_token(name: str, value: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise SqlIngestError(
-            f"{name} must be a non-empty, non-whitespace str, got "
-            f"{type(value).__name__}={value!r}"
-        )
-    # Leading/trailing whitespace is silently tolerated by some ODBC driver
-    # managers and rejected by others; rather than silently strip (which
-    # would hide caller-side typos like copy-pasting from docs), reject at
-    # the boundary with an actionable message.
-    if value != value.strip():
-        raise SqlIngestError(
-            f"{name} has leading/trailing whitespace: {value!r}. "
-            "Strip at the call site for consistent cross-platform behavior."
-        )
-    for ch in _SQL_CONN_STR_FORBIDDEN:
-        if ch in value:
-            raise SqlIngestError(
-                f"{name} contains forbidden character {ch!r}: {value!r}"
-            )
-    return value
-
-
-@overload
-def _sql_check_int(
-    name: str,
-    value: int | None,
-    *,
-    minv: int,
-    maxv: int,
-    allow_none: Literal[False] = ...,
-) -> int: ...
-
-
-@overload
-def _sql_check_int(
-    name: str,
-    value: int | None,
-    *,
-    minv: int,
-    maxv: int,
-    allow_none: Literal[True],
-) -> int | None: ...
-
-
-def _sql_check_int(
-    name: str,
-    value: int | None,
-    *,
-    minv: int,
-    maxv: int,
-    allow_none: bool = False,
-) -> int | None:
-    if value is None:
-        if allow_none:
-            return None
-        raise SqlIngestError(f"{name} must not be None")
-    # bool is an int subclass in Python; reject explicitly to prevent
-    # `port=True` silently meaning 1.
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise SqlIngestError(
-            f"{name} must be int, got {type(value).__name__}={value!r}"
-        )
-    if not (minv <= value <= maxv):
-        raise SqlIngestError(
-            f"{name} must be in [{minv}, {maxv}], got {value}"
-        )
-    return value
-
-
-def _sql_check_bool(name: str, value: bool) -> None:
-    # Guard against truthy-string / int-1 sneaking in through kwargs.
-    if not isinstance(value, bool):
-        raise SqlIngestError(
-            f"{name} must be bool, got {type(value).__name__}={value!r}"
-        )
-
-
-def _sql_check_optional_bool(name: str, value: bool | None) -> None:
-    if value is None:
-        return
-    _sql_check_bool(name, value)
-
-
-def _sql_check_optional_str(name: str, value: str | None) -> None:
-    if value is not None and not isinstance(value, str):
-        raise SqlIngestError(
-            f"{name} must be str or None, got {type(value).__name__}={value!r}"
-        )
-
-
-def _sql_check_no_control_chars(name: str, value: str) -> None:
-    """Reject NUL / LF / CR inside a credential or similar token.
-
-    These are almost always artifacts of reading the value from stdin or
-    from a text file without stripping the trailing newline, and the
-    downstream ODBC error message differs by platform (Windows returns
-    SQLSTATE 28000 while unixODBC on Linux typically returns IM002), so
-    catch them at our boundary with an actionable message.
-    """
-    for bad in ("\x00", "\n", "\r"):
-        if bad in value:
-            raise SqlIngestError(
-                f"{name} contains a control character {bad!r}; commonly "
-                "seen when reading credentials from stdin or a file "
-                "without stripping a trailing newline"
-            )
-
-
-def _sql_find_duplicates(names: Sequence[str]) -> list[str]:
-    # Companion ``dupes_seen`` set keeps dedup-of-dupes O(1); without it
-    # ``n not in dupes`` would degrade to O(n^2) on a pathological
-    # multi-thousand-column result.
-    seen: set[str] = set()
-    dupes_seen: set[str] = set()
-    dupes: list[str] = []
-    for n in names:
-        if n in seen and n not in dupes_seen:
-            dupes.append(n)
-            dupes_seen.add(n)
-        seen.add(n)
-    return sorted(dupes)
 
 
 def _sql_normalize_server(server: str) -> tuple[str, bool]:
@@ -4207,72 +4239,6 @@ def _sql_validate_parameters(
     return params
 
 
-def _sql_check_finite_numerics(
-    df: pl.DataFrame, *, require: bool
-) -> None:
-    """Reject NULL / NaN / +-Inf in numeric columns when ``require=True``.
-
-    Implements CLAUDE.md inbound boundary contract item 4 ("Finiteness")
-    for the SQL-Server ingest path. For Int/UInt/Decimal columns we
-    reject only NULL (those types cannot represent NaN/Inf). For
-    Float32/Float64 we additionally reject NaN / +Inf / -Inf via
-    ``is_finite``. Defaults off because SQL Server NULL columns are a
-    documented expectation per CLAUDE.md ("except where NaN is documented
-    as expected"); enable explicitly for tables where NULL/NaN indicates
-    upstream corruption.
-
-    Polars-call exceptions are wrapped to ``SqlIngestError`` to keep the
-    wrapper's "all failures surface as ``SqlIngestError``" contract intact
-    on dtype-API drift across polars releases. The loop does NOT abort on
-    the first polars-side exception: data violations on other columns are
-    still collected and surfaced, with the API-error column listed
-    alongside.
-    """
-    if not require:
-        return
-    bad: list[str] = []
-    api_errors: list[tuple[str, Exception]] = []
-    for name, dtype in df.schema.items():
-        if not isinstance(dtype, _NUMERIC_DTYPE_CLASSES):
-            continue
-        try:
-            if df[name].null_count() > 0:
-                bad.append(name)
-                continue
-            if isinstance(dtype, _FLOAT_DTYPE_CLASSES):
-                # ``is_finite`` returns False for NaN / +Inf / -Inf. On an
-                # empty Series ``.all()`` returns True (vacuous), which is
-                # the correct semantics — nothing to violate.
-                if not bool(df[name].is_finite().all()):
-                    bad.append(name)
-        except MemoryError:
-            # Allocation failure during column-wide scans is a process-
-            # level signal, not a per-column polars-API drift; let it
-            # propagate so the caller sees a clear OOM rather than the
-            # misleading "finiteness check failed on N columns" report.
-            raise
-        except Exception as exc:  # noqa: BLE001
-            api_errors.append((name, exc))
-    if bad:
-        msg = (
-            "require_finite_numerics=True but numeric columns contain "
-            f"NULL / NaN / Inf: {bad}"
-        )
-        if api_errors:
-            err_cols = [n for n, _ in api_errors]
-            msg += (
-                " (additionally, the check could not be evaluated on "
-                f"columns: {err_cols})"
-            )
-        raise SqlIngestError(msg)
-    if api_errors:
-        bad_name, api_err = api_errors[0]
-        raise SqlIngestError(
-            f"finiteness check failed on column {bad_name!r}: "
-            f"{type(api_err).__name__}: {api_err}"
-        ) from api_err
-
-
 def _sql_validate_expected_columns(
     expected_columns: Sequence[str] | None,
 ) -> list[str] | None:
@@ -4296,7 +4262,7 @@ def _sql_validate_expected_columns(
                 f"expected_columns[{i}] must be non-empty str, got "
                 f"{type(c).__name__}={c!r}"
             )
-    dupes = _sql_find_duplicates(out)
+    dupes = _sql_check.find_duplicates(out)
     if dupes:
         raise SqlIngestError(f"expected_columns contains duplicates: {dupes}")
     return out
@@ -4480,9 +4446,9 @@ def sql_query(
     threads without their own synchronization (standard Polars rules).
     """
     # --- input validation (inbound boundary) ---------------------------------
-    _sql_check_conn_token("server", server)
-    _sql_check_conn_token("database", database)
-    _sql_check_conn_token("driver", driver)
+    _sql_check.conn_token("server", server)
+    _sql_check.conn_token("database", database)
+    _sql_check.conn_token("driver", driver)
 
     # Normalize known driver strings to fix unixODBC case-sensitivity on Linux
     _known_drivers = {
@@ -4510,27 +4476,27 @@ def sql_query(
             "file as plain UTF-8, or strip via query.replace('\\ufeff', '')"
         )
 
-    _sql_check_int("port", port, minv=1, maxv=65_535)
-    _sql_check_int("batch_size", batch_size, minv=1, maxv=_SQL_MAX_BATCH_SIZE)
+    _sql_check.int_("port", port, minv=1, maxv=65_535)
+    _sql_check.int_("batch_size", batch_size, minv=1, maxv=_MAX_BATCH_SIZE)
     # ``login_timeout_sec=0`` is the ODBC convention for "no timeout"
     # — a connect that hangs forever is almost always a misconfig
     # (firewall blackhole, wrong host) rather than something a caller
     # actually wants. Force a positive bound; if "very long" is truly
-    # desired, ``_SQL_MAX_TIMEOUT_SEC`` (1 day) is the practical
-    # ceiling. Matches ``redshift_query``'s ``_validate_numeric_params``.
-    _sql_check_int(
-        "login_timeout_sec", login_timeout_sec, minv=1, maxv=_SQL_MAX_TIMEOUT_SEC
+    # desired, ``_MAX_TIMEOUT_SEC`` (1 day) is the practical ceiling.
+    # Matches ``redshift_query``'s ``_validate_numeric_params``.
+    _sql_check.int_(
+        "login_timeout_sec", login_timeout_sec, minv=1, maxv=_MAX_TIMEOUT_SEC
     )
     # ``query_timeout_sec=None`` is the explicit "no timeout" path
     # (allow_none=True). Reject the implicit ``=0`` ODBC sentinel so
     # the caller has to choose deliberately between a positive cap
     # and ``None``; mixing the two conventions hides intent at the
     # call site. Matches ``redshift_query``'s ``_validate_numeric_params``.
-    _sql_check_int(
+    _sql_check.int_(
         "query_timeout_sec",
         query_timeout_sec,
         minv=1,
-        maxv=_SQL_MAX_TIMEOUT_SEC,
+        maxv=_MAX_TIMEOUT_SEC,
         allow_none=True,
     )
     # ``max_rows=0`` is degenerate: any non-empty result aborts and an
@@ -4538,32 +4504,32 @@ def sql_query(
     # server side, which is the right place to express it.  Force a
     # positive cap so the parameter's intent ("abort runaway streaming
     # above N rows") is unambiguous, matching ``redshift_query``.
-    max_rows_val = _sql_check_int(
-        "max_rows", max_rows, minv=1, maxv=_SQL_MAX_ROWS_CAP, allow_none=True
+    max_rows_val = _sql_check.int_(
+        "max_rows", max_rows, minv=1, maxv=_MAX_ROWS_CAP, allow_none=True
     )
-    _sql_check_int(
+    _sql_check.int_(
         "max_text_size",
         max_text_size,
         minv=1,
-        maxv=_SQL_MAX_VALUE_BYTES,
+        maxv=_MAX_VALUE_BYTES,
         allow_none=True,
     )
-    _sql_check_int(
+    _sql_check.int_(
         "max_binary_size",
         max_binary_size,
         minv=1,
-        maxv=_SQL_MAX_VALUE_BYTES,
+        maxv=_MAX_VALUE_BYTES,
         allow_none=True,
     )
-    _sql_check_bool("require_non_empty", require_non_empty)
-    _sql_check_bool("allow_extra_columns", allow_extra_columns)
-    _sql_check_bool("require_tz_aware_timestamps", require_tz_aware_timestamps)
-    _sql_check_bool("require_finite_numerics", require_finite_numerics)
-    _sql_check_optional_bool("encrypt", encrypt)
-    _sql_check_optional_bool("trust_server_certificate", trust_server_certificate)
+    _sql_check.bool_("require_non_empty", require_non_empty)
+    _sql_check.bool_("allow_extra_columns", allow_extra_columns)
+    _sql_check.bool_("require_tz_aware_timestamps", require_tz_aware_timestamps)
+    _sql_check.bool_("require_finite_numerics", require_finite_numerics)
+    _sql_check.optional_bool("encrypt", encrypt)
+    _sql_check.optional_bool("trust_server_certificate", trust_server_certificate)
 
-    _sql_check_optional_str("user", user)
-    _sql_check_optional_str("password", password)
+    _sql_check.optional_str("user", user)
+    _sql_check.optional_str("password", password)
     if (user is None) != (password is None):
         raise SqlIngestError(
             "user and password must be supplied together, or both omitted "
@@ -4573,14 +4539,14 @@ def sql_query(
     if user is not None:
         if not user:
             raise SqlIngestError("user must be non-empty when provided")
-        _sql_check_no_control_chars("user", user)
+        _sql_check.no_control_chars("user", user)
     if password is not None:
         if not password:
             # Empty password is almost always an unset-env-var typo; reject
             # so the caller finds out at our boundary, not via a cryptic
             # ODBC auth failure later.
             raise SqlIngestError("password must be non-empty when provided")
-        _sql_check_no_control_chars("password", password)
+        _sql_check.no_control_chars("password", password)
         # ``_redact_secrets`` skips substrings shorter than
         # ``_MIN_SECRET_REDACTION_LEN`` to avoid destroying error
         # readability. Without a matching boundary reject, a caller with
@@ -4598,7 +4564,7 @@ def sql_query(
                 "connection string or driver kwargs are echoed."
             )
 
-    _sql_check_optional_str("authentication", authentication)
+    _sql_check.optional_str("authentication", authentication)
     if authentication is not None:
         if authentication not in _SQL_AUTHENTICATION_VALUES:
             raise SqlIngestError(
@@ -4634,7 +4600,7 @@ def sql_query(
     # Brace-quote DATABASE for symmetry with DRIVER so values containing
     # "=" or other ODBC-reserved punctuation can never be mis-parsed by
     # downstream tools (some driver managers, proxies, and monitoring
-    # probes tokenize loosely).  `_sql_check_conn_token` already rejects `{`,
+    # probes tokenize loosely).  `_sql_check.conn_token` already rejects `{`,
     # `}`, `;`, NUL, CR, LF in `database`, so brace-quoting is closed-form
     # safe — the value can never contain the closing `}` that would break
     # the quoting.
@@ -4765,7 +4731,7 @@ def sql_query(
             # clear error rather than letting pl.from_arrow raise an opaque
             # ComputeError.
             schema_names: list[str] = list(schema.names)
-            schema_dupes = _sql_find_duplicates(schema_names)
+            schema_dupes = _sql_check.find_duplicates(schema_names)
             if schema_dupes:
                 raise SqlIngestError(
                     f"duplicate column names in server result set: "
@@ -4867,14 +4833,6 @@ def sql_query(
         )
 
     # --- post-load caller-facing checks --------------------------------------
-    cols_dupes = _sql_find_duplicates(cols)
-    if cols_dupes:
-        # Unreachable given the pre-conversion schema check, but kept as a
-        # defense-in-depth guard against future arrow/polars behavior drift.
-        raise SqlIngestError(
-            f"duplicate column names in result set: {cols_dupes}"
-        )
-
     if expected is not None:
         missing = [c for c in expected if c not in cols]
         extra = [c for c in cols if c not in expected]
@@ -4902,7 +4860,7 @@ def sql_query(
             "(require_non_empty=True)"
         )
 
-    _sql_check_finite_numerics(df, require=require_finite_numerics)
+    _sql_check.finite_numerics(df, require=require_finite_numerics)
 
     return df
 
@@ -4936,10 +4894,12 @@ class _ArrowBatchReader(Protocol):
 # Module-level constants
 # =============================================================================
 
-# Characters that would let an attacker (or a malformed config value) escape
-# a DRIVER={...} / SERVER=... / DATABASE=... segment and inject arbitrary
-# ODBC connection-string keys.
-_CONN_STR_FORBIDDEN = (";", "{", "}", "\x00", "\n", "\r")
+# Boundary validators bound to ``RedshiftIngestError``.  See
+# ``_BoundaryChecker`` at module top — one implementation, parameterized
+# on the exception class.  ``_CONN_STR_FORBIDDEN`` / ``_MAX_BATCH_SIZE`` /
+# ``_MAX_TIMEOUT_SEC`` / ``_MAX_ROWS_CAP`` / ``_MAX_VALUE_BYTES`` are also
+# defined once at module top and shared with sql_query.
+_rs_check = _BoundaryChecker(RedshiftIngestError)
 
 # Characters forbidden inside an individual DbGroups entry. We join groups
 # with "," to form the DbGroups value, so a comma inside a name would be
@@ -4948,11 +4908,6 @@ _CONN_STR_FORBIDDEN = (";", "{", "}", "\x00", "\n", "\r")
 # reject at the boundary.
 _DB_GROUP_FORBIDDEN = (",", ";", "{", "}", "\x00", "\n", "\r", " ", "\t")
 
-# Generous but finite upper bounds to catch typos without over-constraining.
-_MAX_BATCH_SIZE = 10_000_000
-_MAX_TIMEOUT_SEC = 86_400  # 1 day; beyond this the caller almost certainly meant "no timeout"
-_MAX_ROWS_CAP = 10**12  # trillion-row hard ceiling on the caller-supplied max_rows
-_MAX_VALUE_BYTES = 2**31 - 1  # 2 GiB; ODBC wide-buffer upper bound
 _MAX_DB_GROUPS = 256  # Redshift has no documented hard limit; this catches typos
 
 # Whitelist of SSLMode values supported by the Amazon Redshift ODBC driver.
@@ -4998,153 +4953,6 @@ _QUERY_FORBIDDEN_CODEPOINTS = frozenset(
 
 
 # =============================================================================
-# Primitive type / range / character checks
-# =============================================================================
-
-
-def _check_conn_token(name: str, value: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise RedshiftIngestError(
-            f"{name} must be a non-empty, non-whitespace str, got "
-            f"{type(value).__name__}={value!r}"
-        )
-    # Leading/trailing whitespace is silently tolerated by some ODBC driver
-    # managers and rejected by others; rather than silently strip (which
-    # would hide caller-side typos like copy-pasting from docs), reject at
-    # the boundary with an actionable message.
-    if value != value.strip():
-        raise RedshiftIngestError(
-            f"{name} has leading/trailing whitespace: {value!r}. "
-            "Strip at the call site for consistent cross-platform behavior."
-        )
-    for ch in _CONN_STR_FORBIDDEN:
-        if ch in value:
-            raise RedshiftIngestError(
-                f"{name} contains forbidden character {ch!r}: {value!r}"
-            )
-    return value
-
-
-def _check_int(
-    name: str,
-    value: int | None,
-    *,
-    minv: int,
-    maxv: int,
-    allow_none: bool = False,
-) -> int | None:
-    if value is None:
-        if allow_none:
-            return None
-        raise RedshiftIngestError(f"{name} must not be None")
-    # bool is an int subclass in Python; reject explicitly to prevent
-    # `port=True` silently meaning 1.
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RedshiftIngestError(
-            f"{name} must be int, got {type(value).__name__}={value!r}"
-        )
-    if not (minv <= value <= maxv):
-        raise RedshiftIngestError(
-            f"{name} must be in [{minv}, {maxv}], got {value}"
-        )
-    return value
-
-
-def _check_bool(name: str, value: bool) -> None:
-    # Guard against truthy-string / int-1 sneaking in through kwargs.
-    if not isinstance(value, bool):
-        raise RedshiftIngestError(
-            f"{name} must be bool, got {type(value).__name__}={value!r}"
-        )
-
-
-def _check_optional_str(
-    name: str, value: str | None, *, sensitive: bool = False
-) -> None:
-    if value is not None and not isinstance(value, str):
-        # For credential-bearing fields, never echo the rejected value:
-        # a bytes-wrapped password (e.g. reading from stdin without
-        # decoding) would otherwise be printed verbatim into logs.
-        shown = "<redacted>" if sensitive else repr(value)
-        raise RedshiftIngestError(
-            f"{name} must be str or None, got {type(value).__name__}={shown}"
-        )
-
-
-def _check_no_control_chars(name: str, value: str) -> None:
-    """Reject NUL / LF / CR inside a credential or similar token.
-
-    These are almost always artifacts of reading the value from stdin or
-    from a text file without stripping the trailing newline, and the
-    downstream ODBC error message differs by platform, so catch them at
-    our boundary with an actionable message.
-    """
-    for bad in ("\x00", "\n", "\r"):
-        if bad in value:
-            raise RedshiftIngestError(
-                f"{name} contains a control character {bad!r}; commonly "
-                "seen when reading credentials from stdin or a file "
-                "without stripping a trailing newline"
-            )
-
-
-def _check_list_or_tuple(name: str, value: object) -> None:
-    """Require a ``list`` / ``tuple`` where a caller-ordered sequence is expected.
-
-    ``Sequence[str]`` in the annotation is enforcement-free at runtime;
-    three distinct traps would otherwise silently produce wrong results:
-
-    * ``str`` / ``bytes`` / ``bytearray`` are Sequences but iterate
-      character-by-character: ``parameters="?"`` silently becomes a
-      single-char sequence instead of ``["?"]``.
-    * ``set`` / ``frozenset`` are not Sequences but ``list(s)`` still
-      works; iteration order is not a caller contract, which scrambles
-      positional ODBC binding without error.
-    * ``dict`` iterates keys only (values dropped) in insertion order —
-      not what a caller passing a mapping expects.
-
-    Accepting only ``list`` / ``tuple`` makes the caller contract
-    explicit and deterministic.
-    """
-    if isinstance(value, (list, tuple)):
-        return
-    if isinstance(value, (str, bytes, bytearray)):
-        reason = (
-            "a bare string/bytes value would be iterated "
-            "character-by-character"
-        )
-    elif isinstance(value, (set, frozenset, dict)):
-        reason = (
-            "unordered/mapping types iterate in a non-caller-controlled "
-            "order and would silently scramble positional binding"
-        )
-    else:
-        reason = (
-            "only list/tuple carry a deterministic, caller-defined order"
-        )
-    raise RedshiftIngestError(
-        f"{name} must be a list or tuple, not {type(value).__name__}: "
-        f"{reason}. Wrap in a list: {name}=[value] (or list(value))."
-    )
-
-
-def _find_duplicates(names: Sequence[str]) -> list[str]:
-    # Companion ``dupes_seen`` set keeps dedup-of-dupes O(1); without it
-    # ``n not in dupes`` would degrade to O(n^2) on a pathological
-    # 10k-column result (e.g. a SELECT with many aliases that collide
-    # after Redshift's unquoted-identifier lower-casing).
-    seen: set[str] = set()
-    dupes_seen: set[str] = set()
-    dupes: list[str] = []
-    for n in names:
-        if n in seen and n not in dupes_seen:
-            dupes.append(n)
-            dupes_seen.add(n)
-        seen.add(n)
-    return sorted(dupes)
-
-
-# =============================================================================
 # Per-field validators (called from the main function)
 # =============================================================================
 
@@ -5152,9 +4960,9 @@ def _find_duplicates(names: Sequence[str]) -> list[str]:
 def _validate_endpoint_identifiers(
     *, host: str, database: str, driver: str
 ) -> None:
-    _check_conn_token("host", host)
-    _check_conn_token("database", database)
-    _check_conn_token("driver", driver)
+    _rs_check.conn_token("host", host)
+    _rs_check.conn_token("database", database)
+    _rs_check.conn_token("driver", driver)
 
 
 def _validate_query(query: str) -> None:
@@ -5208,14 +5016,14 @@ def _validate_numeric_params(
     every other field keeps its original variable name in the caller, so
     we just check-and-discard.
     """
-    _check_int("port", port, minv=1, maxv=65_535)
-    _check_int("batch_size", batch_size, minv=1, maxv=_MAX_BATCH_SIZE)
+    _rs_check.int_("port", port, minv=1, maxv=65_535)
+    _rs_check.int_("batch_size", batch_size, minv=1, maxv=_MAX_BATCH_SIZE)
     # ``login_timeout_sec=0`` is the ODBC convention for "no timeout"
     # — a connect that hangs forever is almost always a misconfig
     # (firewall blackhole, wrong host) rather than something a caller
     # actually wants. Force a positive bound; if "very long" is truly
     # desired, ``_MAX_TIMEOUT_SEC`` (1 day) is the practical ceiling.
-    _check_int(
+    _rs_check.int_(
         "login_timeout_sec",
         login_timeout_sec,
         minv=1,
@@ -5226,7 +5034,7 @@ def _validate_numeric_params(
     # the caller has to choose deliberately between a positive cap
     # and ``None``; mixing the two conventions hides intent at the
     # call site.
-    _check_int(
+    _rs_check.int_(
         "query_timeout_sec",
         query_timeout_sec,
         minv=1,
@@ -5238,17 +5046,17 @@ def _validate_numeric_params(
     # the server side, which is the right place to express it. Force
     # a positive cap so the parameter's intent ("abort runaway
     # streaming above N rows") is unambiguous.
-    max_rows_val = _check_int(
+    max_rows_val = _rs_check.int_(
         "max_rows", max_rows, minv=1, maxv=_MAX_ROWS_CAP, allow_none=True
     )
-    _check_int(
+    _rs_check.int_(
         "max_text_size",
         max_text_size,
         minv=1,
         maxv=_MAX_VALUE_BYTES,
         allow_none=True,
     )
-    _check_int(
+    _rs_check.int_(
         "max_binary_size",
         max_binary_size,
         minv=1,
@@ -5267,12 +5075,12 @@ def _validate_bool_flags(
     iam: bool,
     auto_create: bool,
 ) -> None:
-    _check_bool("require_non_empty", require_non_empty)
-    _check_bool("allow_extra_columns", allow_extra_columns)
-    _check_bool("require_tz_aware_timestamps", require_tz_aware_timestamps)
-    _check_bool("require_finite_numerics", require_finite_numerics)
-    _check_bool("iam", iam)
-    _check_bool("auto_create", auto_create)
+    _rs_check.bool_("require_non_empty", require_non_empty)
+    _rs_check.bool_("allow_extra_columns", allow_extra_columns)
+    _rs_check.bool_("require_tz_aware_timestamps", require_tz_aware_timestamps)
+    _rs_check.bool_("require_finite_numerics", require_finite_numerics)
+    _rs_check.bool_("iam", iam)
+    _rs_check.bool_("auto_create", auto_create)
 
 
 def _validate_optional_credential_strings(
@@ -5287,7 +5095,7 @@ def _validate_optional_credential_strings(
     several fields are misconfigured at once.
     """
     for name, value in fields.items():
-        _check_optional_str(
+        _rs_check.optional_str(
             name, value, sensitive=name in _SENSITIVE_CRED_FIELDS
         )
     for name, value in fields.items():
@@ -5300,7 +5108,7 @@ def _validate_optional_credential_strings(
             raise RedshiftIngestError(
                 f"{name} must be non-empty when provided"
             )
-        _check_no_control_chars(name, value)
+        _rs_check.no_control_chars(name, value)
         for ch in _CONN_STR_FORBIDDEN:
             if ch in value:
                 raise RedshiftIngestError(
@@ -5384,7 +5192,7 @@ def _validate_parameters(
 ) -> list[str | None] | None:
     if parameters is None:
         return None
-    _check_list_or_tuple("parameters", parameters)
+    _rs_check.list_or_tuple("parameters", parameters)
     params = list(parameters)
     for i, p in enumerate(params):
         if p is not None and not isinstance(p, str):
@@ -5402,7 +5210,7 @@ def _validate_expected_columns(
 ) -> list[str] | None:
     if expected_columns is None:
         return None
-    _check_list_or_tuple("expected_columns", expected_columns)
+    _rs_check.list_or_tuple("expected_columns", expected_columns)
     out = list(expected_columns)
     for i, c in enumerate(out):
         if not isinstance(c, str) or not c:
@@ -5410,7 +5218,7 @@ def _validate_expected_columns(
                 f"expected_columns[{i}] must be non-empty str, got "
                 f"{type(c).__name__}={c!r}"
             )
-    dupes = _find_duplicates(out)
+    dupes = _rs_check.find_duplicates(out)
     if dupes:
         raise RedshiftIngestError(
             f"expected_columns contains duplicates: {dupes}"
@@ -5436,7 +5244,7 @@ def _validate_db_groups(
     """
     if db_groups is None:
         return None
-    _check_list_or_tuple("db_groups", db_groups)
+    _rs_check.list_or_tuple("db_groups", db_groups)
     groups = list(db_groups)
     if not groups:
         # An empty list is almost always a config bug (e.g. an unset
@@ -5472,7 +5280,7 @@ def _validate_db_groups(
                     f"db_groups[{i}]={g!r} contains forbidden character "
                     f"{ch!r}"
                 )
-    dupes = _find_duplicates(groups)
+    dupes = _rs_check.find_duplicates(groups)
     if dupes:
         raise RedshiftIngestError(
             f"db_groups contains duplicates: {dupes}"
@@ -5910,7 +5718,7 @@ def _check_schema_no_duplicates(schema: pa.Schema) -> list[str]:
             f"failed to read arrow schema field names: "
             f"{type(exc).__name__}: {exc}"
         ) from None
-    dupes = _find_duplicates(names)
+    dupes = _rs_check.find_duplicates(names)
     if dupes:
         raise RedshiftIngestError(
             f"duplicate column names in server result set: {dupes}"
@@ -6074,14 +5882,6 @@ def _arrow_table_to_polars(
             "row-count invariant violated in arrow->polars conversion: "
             f"expected {expected_rows}, got {df.height}"
         )
-    cols_dupes = _find_duplicates(cols)
-    if cols_dupes:
-        # Unreachable given the pre-conversion schema check, but kept as
-        # a defense-in-depth guard against future arrow/polars behavior
-        # drift.
-        raise RedshiftIngestError(
-            f"duplicate column names in result set: {cols_dupes}"
-        )
     return df
 
 
@@ -6188,90 +5988,6 @@ def _check_non_empty(
             f"query returned 0 rows against {host}/{database} "
             "(require_non_empty=True)"
         )
-
-
-def _check_finite_numerics(
-    df: pl.DataFrame, *, require: bool
-) -> None:
-    """Reject NULL / NaN / ±Inf in numeric columns when ``require=True``.
-
-    Implements CLAUDE.md inbound boundary contract item 4
-    "Finiteness". For Int/UInt/Decimal columns we reject only NULL
-    (those types cannot represent NaN/Inf). For Float32/Float64 we
-    additionally reject NaN / +Inf / -Inf via ``is_finite``. Defaults
-    off because Redshift NULL columns are a documented expectation per
-    CLAUDE.md ("except where NaN is documented as expected"); enable
-    explicitly for tables where NULL/NaN indicates upstream corruption
-    (e.g. mid-day-snapshot pricing where every row should be filled).
-
-    Polars-call exceptions are wrapped to ``RedshiftIngestError`` to
-    keep the wrapper's "all failures surface as ``RedshiftIngestError``"
-    contract intact, even on dtype-API drift across polars releases.
-    The loop does NOT abort on the first polars-side exception: data
-    violations on other columns are still collected and surfaced, with
-    the API-error column listed alongside. CLAUDE.md inbound rule is
-    "fail loud with a message naming the offending column"; that's
-    served best by reporting all bad columns at once, not the first
-    one we tripped over.
-    """
-    if not require:
-        return
-    bad: list[str] = []
-    api_errors: list[tuple[str, Exception]] = []
-    for name, dtype in df.schema.items():
-        if not isinstance(dtype, _NUMERIC_DTYPE_CLASSES):
-            continue
-        try:
-            if df[name].null_count() > 0:
-                bad.append(name)
-                continue
-            if isinstance(dtype, _FLOAT_DTYPE_CLASSES):
-                # ``is_finite`` returns False for NaN / +Inf / -Inf.
-                # On an empty Series ``.all()`` returns True (vacuous),
-                # which is the correct semantics — nothing to violate.
-                if not bool(df[name].is_finite().all()):
-                    bad.append(name)
-        except MemoryError:
-            # Allocation failure on a wide column scan is a process-level
-            # signal, not per-column polars-API drift. Propagate so the
-            # caller sees a clean OOM rather than a misleading
-            # "finiteness check failed on N columns" aggregate. Subsequent
-            # columns would also OOM and obscure the root cause.
-            raise
-        except Exception as exc:  # noqa: BLE001
-            # Polars dtype-API drift on this column; capture and keep
-            # checking the rest so the operator sees every problem at
-            # once. Report-style chosen below.
-            api_errors.append((name, exc))
-    if bad:
-        msg = (
-            "require_finite_numerics=True but numeric columns contain "
-            f"NULL / NaN / Inf: {bad}"
-        )
-        if api_errors:
-            err_cols = [n for n, _ in api_errors]
-            msg += (
-                " (additionally, the check could not be evaluated on "
-                f"columns: {err_cols})"
-            )
-        raise RedshiftIngestError(msg)
-    if api_errors:
-        # Variable is named ``api_err`` (not ``exc``) because Python 3
-        # implicitly ``del exc`` at the end of an ``except ... as exc``
-        # block (PEP 3134), and re-binding the same name outside the
-        # except confuses mypy under ``--strict`` (see
-        # ``[misc]`` "Assignment to variable ... outside except: block").
-        bad_name, api_err = api_errors[0]
-        # ``from api_err`` matches the discipline of the other
-        # post-reader helpers (``_assemble_arrow_table`` /
-        # ``_arrow_table_to_polars``): at this stage there are no
-        # credentials in scope, and the original polars exception text
-        # is debug-useful (which dtype API was missing) without leaking
-        # secrets.
-        raise RedshiftIngestError(
-            f"finiteness check failed on column {bad_name!r}: "
-            f"{type(api_err).__name__}: {api_err}"
-        ) from api_err
 
 
 # =============================================================================
@@ -6635,7 +6351,7 @@ def redshift_query(
     _check_non_empty(
         df, require=require_non_empty, host=host, database=database
     )
-    _check_finite_numerics(df, require=require_finite_numerics)
+    _rs_check.finite_numerics(df, require=require_finite_numerics)
 
     return df
 

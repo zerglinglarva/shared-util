@@ -31,6 +31,7 @@ from matplotlib.figure import Figure
 
 __all__ = [
     "parse_yyyymmdd",
+    "compute_lookback_startdate",
     "compute_mtd_date_range",
     "lazy_parquet",
     "winsorized_rolling_stats",
@@ -396,6 +397,42 @@ def parse_yyyymmdd(value: str | None, label: str) -> datetime.date | None:
             f"Invalid date format. Expected YYYYMMDD (e.g. 20241231), "
             f"got {label}='{value}'. Original error: {exc}"
         ) from exc
+
+#################################################################################################
+# compute_lookback_startdate — resolve the trading session that is N sessions before startdate
+
+def compute_lookback_startdate(
+    startdate: datetime.date,
+    exchange: str,
+    lookback_trading_days: int,
+) -> datetime.date:
+    """Return the trading session that is ``lookback_trading_days`` sessions before ``startdate`` on the given exchange.
+
+    ``exchange`` is an ``exchange_calendars`` ISO-MIC code (e.g. ``"XNYS"``,
+    ``"XNAS"``); it is passed straight to ``xcals.get_calendar`` and an unknown
+    code raises there with a clear message. ``lookback_trading_days`` is the
+    integer number of sessions to step back; precondition >= 1, guarded at the
+    module-level constant's definition site.
+
+    The function asks the calendar to enumerate every session in a generously
+    overprovisioned calendar-day window, then slices the last
+    ``lookback_trading_days`` to get an exact answer — the calendar-day
+    arithmetic is intentionally loose; exactness comes from the slice, not from
+    the arithmetic.
+    """
+    cal = xcals.get_calendar(exchange)
+    earliest = startdate - datetime.timedelta(days=lookback_trading_days * 2 + 14)
+    sessions_before = cal.sessions_in_range(
+        earliest, startdate - datetime.timedelta(days=1)
+    ).date
+    if len(sessions_before) < lookback_trading_days:
+        raise ValueError(
+            f"Cannot resolve {lookback_trading_days} trading sessions before "
+            f"{startdate}; only {len(sessions_before)} found in "
+            f"[{earliest}, {startdate - datetime.timedelta(days=1)}]"
+        )
+    return cast(datetime.date, sessions_before[-lookback_trading_days])
+
 
 #################################################################################################
 # Compute default month-to-date date range from the composite exchange calendar of the given venues.
@@ -1598,7 +1635,11 @@ def save_matplotlib_charts_as_html(
     folder_path = _resolve_folder_path(write_directory, subfolder)
 
     # ── Step 3: Build paths and check lengths ───────────────────────────
-    file_name = f"{file_name_prefix}_charts.html"
+    # Timestamp (YYYYMMDDHHMM, _REPORT_TZ) baked into the filename so repeat
+    # runs do not overwrite prior reports; same TZ as the "Generated:" header
+    # below for cross-reference.
+    save_ts = datetime.datetime.now(tz=_REPORT_TZ).strftime("%Y%m%d%H%M")
+    file_name = f"{file_name_prefix}-{save_ts}.html"
     file_path = str(Path(folder_path) / file_name)
     tmp_path = f"{file_path}.{uuid.uuid4().hex[:8]}.tmp"
     _validate_path_lengths(tmp_path)
@@ -1612,7 +1653,15 @@ def save_matplotlib_charts_as_html(
     # forever — over months on a shared folder these accumulate without
     # bound.  Cleanup is best-effort; any failure is silently suppressed
     # inside the helper.
-    _cleanup_stale_files(folder_path, max_age_seconds=86400, prefix=file_name_prefix)
+    # 24h threshold for orphaned .tmp; 92d threshold for finished
+    # <prefix>-YYYYMMDDHHMM.html outputs (each save now produces a
+    # timestamped file rather than overwriting, so prune by age here).
+    _cleanup_stale_files(
+        folder_path,
+        max_age_seconds=86400,
+        prefix=file_name_prefix,
+        html_output_max_age_seconds=92 * 86400,
+    )
 
     # ── Step 5: Render figures to base64 PNGs ───────────────────────────
     safe_prefix = html.escape(file_name_prefix)
@@ -1769,13 +1818,22 @@ except Exception as _tz_exc:  # noqa: BLE001 — degraded-mode fallback
 _MAX_CHARTS_HTML_BYTES: int = 100 * 1024 * 1024
 
 
-def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) -> None:
-    """Remove orphaned .tmp and .time_probe_ files older than max_age_seconds.
+def _cleanup_stale_files(
+    folder_path: str,
+    max_age_seconds: int,
+    prefix: str,
+    *,
+    html_output_max_age_seconds: int | None = None,
+) -> None:
+    """Remove orphaned .tmp / .time_probe_ files older than max_age_seconds,
+    and optionally finished ``<prefix>-YYYYMMDDHHMM.html`` outputs older
+    than html_output_max_age_seconds (opt-in; ``None`` skips that sweep).
 
     Patterns recognized:
       * save_results           → ``<prefix>.parquet.<uuid8>.tmp``
                               or ``<prefix>-YYYYMM-YYYYMM.parquet.<uuid8>.tmp``
-      * save_matplotlib_charts → ``<prefix>_charts.html.<uuid8>.tmp``
+      * save_matplotlib_charts → ``<prefix>-YYYYMMDDHHMM.html.<uuid8>.tmp``  (orphan)
+                              or ``<prefix>-YYYYMMDDHHMM.html``              (finished, opt-in)
 
     Uses a probe file for the NAS server's current time (avoids client-NAS
     clock drift). If the probe fails, cleanup is aborted (better than
@@ -1818,14 +1876,33 @@ def _cleanup_stale_files(folder_path: str, max_age_seconds: int, prefix: str) ->
                         is_stale_tmp = True
             if not is_stale_tmp and f_cf.endswith(".tmp") and ".html." in f_cf:
                 base_name_cf = f_cf.rsplit(".html.", 1)[0]
-                if base_name_cf == f"{prefix_cf}_charts":
-                    is_stale_tmp = True
+                # Match save_matplotlib_charts_as_html naming:
+                # ``<prefix>-YYYYMMDDHHMM.html.<uuid8>.tmp``.
+                if base_name_cf.startswith(f"{prefix_cf}-"):
+                    ts_part = base_name_cf[len(prefix_cf) + 1 :]
+                    if re.match(r"^\d{12}$", ts_part):
+                        is_stale_tmp = True
             is_orphaned_probe = f.startswith(".time_probe_")
-            if not (is_stale_tmp or is_orphaned_probe):
+            # Finished HTML outputs from save_matplotlib_charts_as_html
+            # (``<prefix>-YYYYMMDDHHMM.html``).  Opt-in via
+            # html_output_max_age_seconds — ``None`` skips this sweep so the
+            # parquet caller never accidentally deletes chart artifacts.
+            is_stale_html_output = False
+            if html_output_max_age_seconds is not None and f_cf.endswith(".html"):
+                base_name_cf = f_cf[: -len(".html")]
+                if base_name_cf.startswith(f"{prefix_cf}-"):
+                    ts_part = base_name_cf[len(prefix_cf) + 1 :]
+                    if re.match(r"^\d{12}$", ts_part):
+                        is_stale_html_output = True
+            if not (is_stale_tmp or is_orphaned_probe or is_stale_html_output):
                 continue
 
+            if is_stale_html_output and html_output_max_age_seconds is not None:
+                age_threshold = html_output_max_age_seconds
+            else:
+                age_threshold = max_age_seconds
             try:
-                if server_now - entry.stat().st_mtime > max_age_seconds:
+                if server_now - entry.stat().st_mtime > age_threshold:
                     entry.unlink()
             except OSError:
                 pass  # Concurrent removal; ignore

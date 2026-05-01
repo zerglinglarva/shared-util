@@ -2,7 +2,6 @@
 # Import Libraries
 from __future__ import annotations
 
-import argparse
 import base64
 import datetime
 import errno
@@ -13,6 +12,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
 import uuid
 import zoneinfo
@@ -30,15 +30,13 @@ from filelock import FileLock
 from matplotlib.figure import Figure
 
 __all__ = [
-    "parse_arguments",
+    "parse_yyyymmdd",
     "compute_mtd_date_range",
     "lazy_parquet",
     "winsorized_rolling_stats",
     "plot_time_series",
     "save_matplotlib_charts_as_html",
     "save_results",
-    "sql_query",
-    "SqlIngestError",
     "redshift_query",
     "RedshiftIngestError",
 ]
@@ -70,7 +68,7 @@ def _datetime_tz(dtype: pl.DataType) -> str | None:
 # such match turns the message into ``<redacted>``-spam. AWS keys are
 # >= 20 chars; any password short enough to hit this gate has much bigger
 # problems than a traceback. The boundary password validators in
-# ``sql_query`` / ``redshift_query`` reject < this many chars at input.
+# ``redshift_query`` rejects < this many chars at input.
 _MIN_SECRET_REDACTION_LEN: int = 4
 
 
@@ -116,8 +114,7 @@ def _build_dtype_tuple(*names: str) -> tuple[type[pl.DataType], ...]:
 
 
 # Numeric dtype classes for the opt-in finiteness checks
-# (CLAUDE.md inbound contract item 4). Shared between sql_query and
-# redshift_query so both ingest paths apply identical semantics.
+# (CLAUDE.md inbound contract item 4). Used by ``redshift_query``.
 _NUMERIC_DTYPE_CLASSES: tuple[type[pl.DataType], ...] = _build_dtype_tuple(
     "Int8", "Int16", "Int32", "Int64",
     "UInt8", "UInt16", "UInt32", "UInt64",
@@ -128,14 +125,13 @@ _FLOAT_DTYPE_CLASSES: tuple[type[pl.DataType], ...] = _build_dtype_tuple(
     "Float32", "Float64"
 )
 
-# Generous but finite upper bounds shared by the ODBC ingest paths
-# (sql_query, redshift_query) to catch typos without over-constraining.
-# 2 GiB covers both ODBC wide-buffer limits and SQL Server's per-value
-# MAX-type ceiling.
+# Generous but finite upper bounds for the ODBC ingest path
+# (redshift_query) to catch typos without over-constraining.
+# 2 GiB covers ODBC wide-buffer limits.
 _MAX_BATCH_SIZE = 10_000_000
 _MAX_TIMEOUT_SEC = 86_400  # 1 day; beyond this the caller almost certainly meant "no timeout"
 _MAX_ROWS_CAP = 10**12  # trillion-row hard ceiling on the caller-supplied max_rows
-_MAX_VALUE_BYTES = 2**31 - 1  # 2 GiB; ODBC wide-buffer / SQL Server MAX-type upper bound
+_MAX_VALUE_BYTES = 2**31 - 1  # 2 GiB; ODBC wide-buffer upper bound
 
 
 # ─── Shared NAS / SMB resilience primitives ───────────────────────────
@@ -238,13 +234,13 @@ def _retry_on_transient_lock(
 
 # Characters that would let an attacker (or a malformed config value) escape
 # a DRIVER={...} / SERVER=... / DATABASE=... segment and inject arbitrary
-# ODBC connection-string keys.  Shared between sql_query and redshift_query.
+# ODBC connection-string keys.  Used by redshift_query.
 _CONN_STR_FORBIDDEN = (";", "{", "}", "\x00", "\n", "\r")
 
 
 class _BoundaryChecker:
     """Boundary validators parameterized on the exception class
-    (``SqlIngestError`` vs ``RedshiftIngestError``)."""
+    (``RedshiftIngestError``)."""
 
     __slots__ = ("error_cls",)
 
@@ -386,188 +382,20 @@ class _BoundaryChecker:
                 f"{type(api_err).__name__}: {api_err}"
             ) from api_err
 
+
 #################################################################################################
-# Parse command line arguments (or use defaults in interactive mode), validate all inputs,
-# and resolve the write directory path.
-# Returns (startdate, enddate, write_directory, input_mode).
-#
-# Supports two execution modes:
-#   1. Interactive (Jupyter / IPython): skips argparse, uses defaults directly.
-#   2. CLI (python script.py ...): parses -s, -e, -w, -i flags via argparse.
-#
-# CLI usage examples:
-#   python price-volume-01-EDA.py                                          # all defaults
-#   python price-volume-01-EDA.py -s 20230101 -e 20231231                  # custom date range
-#   python price-volume-01-EDA.py --start-date 20230101 --end-date 20231231 --write-to prod
-#   python price-volume-01-EDA.py -w prod -i cold                          # cold input tier
-
-
-def parse_arguments(
-    default_startdate: datetime.date,
-    default_enddate: datetime.date,
-    default_write_mode: Literal["dev", "prod"],
-    default_input_mode: Literal["hot", "cold"],
-    dev_folder: str,
-    prod_folder: str,
-) -> tuple[datetime.date, datetime.date, str, str]:
-
-    # Detect interactive (Jupyter ZMQ kernel or REPL) vs CLI invocation.
-    is_interactive = hasattr(sys, "ps1")
+# Date parser
+def parse_yyyymmdd(value: str | None, label: str) -> datetime.date | None:
+    """Parse a YYYYMMDD CLI string; return None if value is None; raise on bad format."""
+    if value is None:
+        return None
     try:
-        from IPython.core.getipython import (  # type: ignore[import-not-found, unused-ignore]
-            get_ipython,
-        )
-
-        _ipython_shell = get_ipython()  # type: ignore[no-untyped-call]
-        if _ipython_shell is not None and "ZMQ" in type(_ipython_shell).__name__:
-            is_interactive = True
-    except Exception as e:  # noqa: BLE001 — best-effort; falls back to sys.ps1
-        logging.getLogger(__name__).debug(
-            "parse_arguments: IPython detection skipped (%s: %s)",
-            type(e).__name__, e,
-        )
-
-    # ── Step 2: Obtain raw string inputs ─────────────────────────────────
-    if is_interactive:
-        # Interactive mode: convert defaults to YYYYMMDD strings (same format argparse would produce)
-        logging.getLogger(__name__).info(
-            "parse_arguments: running in interactive mode; using default parameters"
-        )
-        start_date_str = default_startdate.strftime("%Y%m%d")
-        end_date_str = default_enddate.strftime("%Y%m%d")
-        write_to = default_write_mode
-        input_mode = default_input_mode
-    else:
-        # CLI mode: define and parse command line arguments
-        parser = argparse.ArgumentParser()
-
-        # -s / --start-date: start of the date range (inclusive), format YYYYMMDD
-        parser.add_argument(
-            "-s",
-            "--start-date",
-            type=str,
-            default=default_startdate.strftime("%Y%m%d"),
-            help=f"\nStart date default is {default_startdate.strftime('%Y%m%d')} in YYYYMMDD format",
-        )
-
-        # -e / --end-date: end of the date range (inclusive), format YYYYMMDD
-        parser.add_argument(
-            "-e",
-            "--end-date",
-            type=str,
-            default=default_enddate.strftime("%Y%m%d"),
-            help=f"\nEnd date default is {default_enddate.strftime('%Y%m%d')} in YYYYMMDD format",
-        )
-
-        # -w / --write-to: target environment for output files ('dev' or 'prod')
-        parser.add_argument(
-            "-w",
-            "--write-to",
-            type=str,
-            default=default_write_mode,
-            help=f"\nDestination to write the results. Default is {default_write_mode}. Options are dev or prod",
-        )
-
-        # -i / --input-mode: input data tier ('hot' or 'cold').  Caller resolves
-        # the actual source folder from this string downstream.
-        parser.add_argument(
-            "-i",
-            "--input-mode",
-            type=str,
-            default=default_input_mode,
-            help=f"\nInput data tier. Default is {default_input_mode}. Options are hot or cold",
-        )
-
-        # Use parse_known_args to gracefully ignore unmapped flags injected
-        # by orchestrators (Airflow / Pytest / wrappers) instead of
-        # triggering ``sys.exit(2)``.  But unknown args MUST surface in logs:
-        # a typo like ``--start-dat 20240101`` would otherwise silently fall
-        # through to the default date with no indication that the caller's
-        # intent was dropped.  One WARNING line per call keeps the noise
-        # bounded while making real typos visible in log aggregation.
-        args, unknown_args = parser.parse_known_args()
-        if unknown_args:
-            logging.getLogger(__name__).warning(
-                "parse_arguments: ignoring %d unknown CLI argument(s): %r. "
-                "If an intended flag appears in this list, check for a typo "
-                "(e.g. '--start-dat' vs '--start-date'); otherwise these "
-                "are orchestrator-injected and can be ignored.",
-                len(unknown_args), unknown_args,
-            )
-        start_date_str = args.start_date
-        end_date_str = args.end_date
-        write_to = args.write_to
-        input_mode = args.input_mode
-
-    # Strict YYYYMMDD parse — no salvage of caller bugs (e.g. 20250631).
-    def _parse_yyyymmdd(value: str, label: str) -> datetime.date:
-        try:
-            return datetime.datetime.strptime(value, "%Y%m%d").date()
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid date format. Expected YYYYMMDD (e.g. 20241231), "
-                f"got {label}='{value}'. Original error: {exc}"
-            ) from exc
-
-    startdate = _parse_yyyymmdd(start_date_str, "start_date")
-    enddate = _parse_yyyymmdd(end_date_str, "end_date")
-
-    # Ensure the date range is logically valid (start on or before end)
-    if startdate > enddate:
+        return datetime.datetime.strptime(value, "%Y%m%d").date()
+    except ValueError as exc:
         raise ValueError(
-            f"start_date ({startdate}) must be on or before end_date ({enddate})"
-        )
-
-    # ── Step 4: Resolve write directory from the mode string ─────────────
-    # Guard against empty folder strings before resolving.  Path("").resolve()
-    # returns the current working directory, so an empty dev_folder/prod_folder
-    # would silently pass the isdir check and write files to the wrong location.
-    if not dev_folder or not dev_folder.strip():
-        raise ValueError("dev_folder must not be empty or whitespace")
-    if not prod_folder or not prod_folder.strip():
-        raise ValueError("prod_folder must not be empty or whitespace")
-
-    # Normalize to lowercase so CLI input like 'DEV', 'Prod' is accepted.
-    # ``write_to`` here is bound to either the ``Literal['dev', 'prod']``
-    # default OR the raw ``argparse`` string; rebinding it to ``.lower()``
-    # output would widen the local type back to ``str`` and trip mypy
-    # under ``--strict``. Use a fresh variable so the Literal narrowing
-    # on ``write_to`` is preserved if anything below ever needs it.
-    write_to_norm = write_to.strip().lower()
-    if write_to_norm == "dev":
-        write_directory = dev_folder
-    elif write_to_norm == "prod":
-        write_directory = prod_folder
-    else:
-        raise ValueError(
-            f"Invalid value for write_to: '{write_to_norm}'. "
-            f"Options are 'dev' or 'prod'"
-        )
-
-    # Resolve to absolute path so the returned directory remains valid even if
-    # the caller changes the working directory before using it (same guard as
-    # lazy_parquet applies to folder_path).
-    write_directory = str(Path(write_directory).resolve())
-
-    # Fail early if the resolved directory doesn't exist on disk
-    if not Path(write_directory).is_dir():
-        raise FileNotFoundError(f"Write directory does not exist: {write_directory}")
-
-    # ── Step 5: Normalize and validate input_mode ────────────────────────
-    # Same hard-reject discipline as write_to: hard-fail on anything outside
-    # {'hot', 'cold'} so a typo like 'warm' or 'HOT2' surfaces immediately
-    # instead of being silently passed to the caller's downstream resolver.
-    # Fresh variable name (vs rebinding ``input_mode``) preserves the
-    # ``Literal['hot', 'cold']`` narrowing on the parameter under
-    # ``mypy --strict`` — see the ``write_to_norm`` comment above.
-    input_mode_norm = input_mode.strip().lower()
-    if input_mode_norm not in ("hot", "cold"):
-        raise ValueError(
-            f"Invalid value for input_mode: '{input_mode_norm}'. "
-            f"Options are 'hot' or 'cold'"
-        )
-
-    return startdate, enddate, write_directory, input_mode_norm
+            f"Invalid date format. Expected YYYYMMDD (e.g. 20241231), "
+            f"got {label}='{value}'. Original error: {exc}"
+        ) from exc
 
 #################################################################################################
 # Compute default month-to-date date range from the composite exchange calendar of the given venues.
@@ -949,7 +777,7 @@ def lazy_parquet(
         House convention for naive data in this codebase is America/New_York.
 
     Set require_tz_aware_timestamps=True to reject tz-naive Datetime at the
-    inbound boundary (mirrors sql_query's flag).
+    inbound boundary (mirrors redshift_query's flag).
 
     The NAS transient-lock retry inside this function covers ONLY the
     metadata reads. The actual payload read happens at .collect() time,
@@ -960,7 +788,7 @@ def lazy_parquet(
         raise ValueError("folder_path must not be empty or whitespace")
     if not date_column or not date_column.strip():
         raise ValueError("date_column must not be empty or whitespace")
-    # bool is an int subclass; reject truthy int (matches sql/redshift_query).
+    # bool is an int subclass; reject truthy int (matches redshift_query).
     if not isinstance(require_tz_aware_timestamps, bool):
         raise TypeError(
             f"require_tz_aware_timestamps must be a bool, got "
@@ -1814,11 +1642,7 @@ def save_matplotlib_charts_as_html(
         try:
             try:
                 fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
-            except Exception as e:
-                # fig.savefig can fail if its canvas is in a bad state or
-                # dpi × size overflows memory.  Wrap with index + title
-                # context so the caller can identify the offending figure
-                # without digging through a raw matplotlib stack trace.
+            except Exception as e:  # noqa: BLE001 — wrap with figure index/title
                 raise RuntimeError(
                     f"save_matplotlib_charts_as_html: fig.savefig failed "
                     f"for figures[{i}] (title={raw_title!r}). "
@@ -1877,26 +1701,10 @@ def save_matplotlib_charts_as_html(
     pre_existed = Path(file_path).exists()
 
     try:
-        # Capture the tmp-side size returned by ``_write_bytes_and_fsync``
-        # so the final file can be re-checked AFTER the atomic rename. The
-        # parquet pipeline does this in ``save_results`` via
-        # ``_verify_written_size`` to detect post-rename truncation by
-        # AV / DLP scanners or NAS write-behind cache bugs. The HTML
-        # pipeline previously stopped at the tmp-side check, leaving a
-        # silent failure mode where the renamed artifact ships truncated
-        # to downstream consumers. Same helper, same contract.
         tmp_size = _write_bytes_and_fsync(html_bytes, tmp_path)
-
-        # Rename phase — delegate to _atomic_replace for 12× retry with
-        # read-only-attribute clearing.  Reuses the same tested path as the
-        # parquet pipeline rather than maintaining a parallel retry loop.
         _atomic_replace(tmp_path, file_path)
         rename_done = True
-
-        # Post-rename size verification, mirroring ``save_results`` Step 10.
-        # ``os.fstat`` on a freshly-opened handle bypasses SMB metadata
-        # cache, so a truncation that happened after rename surfaces as
-        # ``OSError("size mismatch")`` instead of being silently shipped.
+        # Post-rename size re-check catches AV/DLP truncation after rename.
         _verify_written_size(file_path, tmp_size)
 
     except BaseException:
@@ -2332,11 +2140,33 @@ def _fsync_and_verify_size(tmp_path: str) -> int:
     return tmp_size
 
 
-def _write_and_fsync(dataframe: pl.DataFrame, tmp_path: str) -> int:
-    """Write DataFrame to a temp parquet, retry on transient NAS OSError
-    (4× with 1s/2s/4s backoff), then fsync via _fsync_and_verify_size.
+def _write_and_fsync(dataframe: pl.DataFrame, file_path: str) -> tuple[str, int]:
+    """Stage DataFrame as parquet next to ``file_path`` via
+    ``tempfile.mkstemp`` (atomic O_EXCL creation, no UUID-collision
+    window), retry on transient NAS OSError (4× with 1s/2s/4s backoff),
+    then fsync via ``_fsync_and_verify_size``. Returns
+    ``(tmp_path, verified_size)``; caller commits via ``_atomic_replace``.
+
+    ``mkstemp`` creates the file with mode 0o600; on POSIX we relax to
+    0o666 (umask-honored on the rename target) so a shared-NAS service
+    account doesn't ship a more restrictive mode than the prior
+    ``write_parquet``-from-scratch behavior. Windows ignores Unix bits.
+
     Polars/Arrow non-OSError exceptions wrap to RuntimeError with context.
-    Partial tmp file cleaned up on any failure before propagating."""
+    Partial tmp file cleaned up on any failure before propagating.
+    """
+    folder = str(Path(file_path).parent)
+    base = Path(file_path).name
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f"{base}.", suffix=".tmp", dir=folder,
+    )
+    os.close(fd)
+    if os.name == "posix":
+        try:
+            Path(tmp_path).chmod(0o666)
+        except OSError:
+            pass  # best-effort; non-fatal mode mismatch on rename target
+
     for _write_attempt in range(4):
         try:
             dataframe.write_parquet(tmp_path)
@@ -2355,7 +2185,7 @@ def _write_and_fsync(dataframe: pl.DataFrame, tmp_path: str) -> int:
                 f"{type(e).__name__}: {e}"
             ) from e
 
-    return _fsync_and_verify_size(tmp_path)
+    return tmp_path, _fsync_and_verify_size(tmp_path)
 
 
 def _write_bytes_and_fsync(data: bytes | bytearray | memoryview, tmp_path: str) -> int:
@@ -2556,10 +2386,11 @@ def save_results(
     )
     folder = Path(folder_path)
     file_path = str(folder / file_name)
-    tmp_path = f"{file_path}.{uuid.uuid4().hex[:8]}.tmp"
     lock_path = str(folder / f".{file_name_prefix}.lock")
 
-    _validate_path_lengths(tmp_path)
+    # Validate the worst-case tmp path before any I/O: mkstemp generates
+    # ``<base>.<8-char-random>.tmp`` so reserve 13 chars on top of file_path.
+    _validate_path_lengths(f"{file_path}.{'X' * 8}.tmp")
     _makedirs_with_retry(folder_path)
     _cleanup_stale_files(folder_path, max_age_seconds=86400, prefix=file_name_prefix)
 
@@ -2578,11 +2409,12 @@ def save_results(
 
     start_time = time.monotonic()
     rename_done = False
+    tmp_path: str | None = None
 
     try:
         # Write parquet OUTSIDE the lock so concurrent workers writing
         # different date ranges can stream in parallel.
-        tmp_size = _write_and_fsync(dataframe, tmp_path)
+        tmp_path, tmp_size = _write_and_fsync(dataframe, file_path)
 
         # On POSIX, pre-create the lock file with 0o666 so different
         # service accounts can acquire the byte lock; umask race is
@@ -2626,7 +2458,7 @@ def save_results(
         _verify_written_size(file_path, tmp_size)
 
     finally:
-        if not rename_done:
+        if not rename_done and tmp_path is not None:
             _unlink_best_effort(tmp_path)
 
     elapsed = (time.monotonic() - start_time) / 60
@@ -2638,605 +2470,6 @@ def save_results(
     print(message, file=sys.stderr, flush=True)
     logging.getLogger(__name__).info(message)
     return file_path
-
-#################################################################################################
-# Function for reading SQL data
-
-class SqlIngestError(RuntimeError):
-    """Boundary-contract failure while ingesting from SQL Server."""
-
-
-# Boundary validators bound to ``SqlIngestError``.  See ``_BoundaryChecker``
-# at module top — one implementation, parameterized on the exception class.
-_sql_check = _BoundaryChecker(SqlIngestError)
-
-
-# Whitelist of `Authentication=...` values accepted by the Microsoft SQL
-# ODBC driver. A whitelist (not free-form str) is required because this
-# value is interpolated into the connection string; allowing arbitrary
-# text would reopen the conn-string injection surface we lock down with
-# _CONN_STR_FORBIDDEN.
-_SQL_AUTH_REQUIRES_CREDS = frozenset(
-    {
-        "ActiveDirectoryPassword",
-        "ActiveDirectoryServicePrincipal",
-        "SqlPassword",
-    }
-)
-_SQL_AUTH_NO_CREDS = frozenset(
-    {
-        "ActiveDirectoryIntegrated",
-        "ActiveDirectoryMsi",
-        "ActiveDirectoryDefault",
-        "ActiveDirectoryInteractive",
-    }
-)
-_SQL_AUTHENTICATION_VALUES = _SQL_AUTH_REQUIRES_CREDS | _SQL_AUTH_NO_CREDS
-
-
-def _sql_normalize_server(server: str) -> tuple[str, bool]:
-    """Return ``(server_value, emit_verbatim)``.
-
-    When ``emit_verbatim`` is True the caller must build
-    ``SERVER={server_value}`` with no ``tcp:`` prefix and no trailing
-    ``,port``. This covers three cases:
-
-      * SQL Server named instances (``HOST\\INSTANCE``), which resolve via
-        the SQL Browser service and must not carry an explicit port.
-      * Windows-only protocol prefixes — ``np:`` (named pipes), ``lpc:``
-        (shared memory / local procedure call), ``admin:`` (Dedicated
-        Admin Connection) — which specify a transport inline and must be
-        passed through unchanged. On non-Windows these paths fail at the
-        driver layer with a clear ODBC error, which is the intended
-        cross-platform behavior.
-
-    For the common ``tcp:HOST`` form we strip the redundant prefix so
-    the caller doesn't emit ``tcp:tcp:HOST``. Stripping happens BEFORE
-    the non-TCP prefix / named-instance detection so callers who
-    programmatically prepend ``tcp:`` to e.g. ``np:HOST`` or
-    ``HOST\\INSTANCE`` still route correctly.
-    """
-    s = server
-    low = s.lower()
-    # Strip redundant leading tcp: prefixes first — otherwise tcp:np:HOST,
-    # tcp:HOST\\INSTANCE, and the pathological tcp:tcp:HOST all bypass
-    # the verbatim-emit branches below. Loop (rather than strip once) so
-    # multi-layer programmatic prepends normalize cleanly.
-    while low.startswith("tcp:"):
-        s = s[4:]
-        if not s.strip():
-            raise SqlIngestError("server is empty after stripping 'tcp:' prefix")
-        low = s.lower()
-
-    if "," in s:
-        raise SqlIngestError(
-            f"server string {server!r} contains a comma. Use the 'port' parameter "
-            "to specify the port number instead."
-        )
-
-    # Windows-only protocol prefixes — keep the prefix, no tcp:/port.
-    # Require a non-empty host segment after the prefix so bare ``"np:"``
-    # / ``"lpc:"`` / ``"admin:"`` fail at our boundary with a clear
-    # message instead of bubbling an opaque ``"Data source name not
-    # found"`` / ``"server not found"`` up from the ODBC layer far from
-    # the call site.
-    for pfx in ("np:", "lpc:", "admin:"):
-        if low.startswith(pfx):
-            if not s[len(pfx):].strip():
-                raise SqlIngestError(
-                    f"server {server!r} has the {pfx!r} protocol prefix "
-                    f"but no host segment follows it; expected "
-                    f"{pfx!r}<host>"
-                )
-            return s, True
-
-    # Named-instance syntax: HOST\INSTANCE. Require non-empty segments
-    # on both sides of a single backslash and reject multi-backslash
-    # strings — neither form is a valid named instance and both would
-    # otherwise reach ODBC as an opaque error.
-    if "\\" in s:
-        instance_parts = s.split("\\")
-        if (
-            len(instance_parts) != 2
-            or not instance_parts[0].strip()
-            or not instance_parts[1].strip()
-        ):
-            raise SqlIngestError(
-                f"server {server!r} uses named-instance syntax "
-                f"(HOST\\INSTANCE) but host or instance segment is empty, "
-                f"or the value contains multiple backslashes"
-            )
-        return s, True
-
-    return s, False
-
-
-def _sql_validate_parameters(
-    parameters: Sequence[str | None] | None,
-) -> list[str | None] | None:
-    if parameters is None:
-        return None
-    # Guard against bare str/bytes: both are Sequence[str]-compatible and
-    # would silently iterate character-by-character (``"SPY"`` → ``['S','P','Y']``),
-    # so the per-element ``isinstance(p, str)`` check below would pass and
-    # arrow_odbc would receive single-character bindings. Fail fast at the
-    # boundary with a descriptive domain exception. Matches the pattern in
-    # ``_mtd_validate_inputs``.
-    if isinstance(parameters, (str, bytes)):
-        raise SqlIngestError(
-            f"parameters must be a sequence of str/None (e.g. list/tuple), "
-            f"not a bare {type(parameters).__name__}: {parameters!r}. "
-            "Wrap single values in a list: parameters=[value]."
-        )
-    params = list(parameters)
-    for i, p in enumerate(params):
-        if p is not None and not isinstance(p, str):
-            raise SqlIngestError(
-                f"parameters[{i}] must be str or None, got "
-                f"{type(p).__name__}={p!r}. arrow_odbc binds ODBC "
-                "parameters as strings; convert numbers via str() at the "
-                "call site."
-            )
-    return params
-
-
-def _sql_validate_expected_columns(
-    expected_columns: Sequence[str] | None,
-) -> list[str] | None:
-    if expected_columns is None:
-        return None
-    # Guard against bare str/bytes: both are Sequence[str]-compatible and
-    # would silently iterate character-by-character (``"Date"`` →
-    # ``['D','a','t','e']``), so the per-element ``isinstance(c, str)`` check
-    # below would pass and the downstream schema comparison would emit a
-    # confusing ``missing=['D','a','t','e']`` error. Fail fast here instead.
-    if isinstance(expected_columns, (str, bytes)):
-        raise SqlIngestError(
-            f"expected_columns must be a sequence of str (e.g. list/tuple), "
-            f"not a bare {type(expected_columns).__name__}: {expected_columns!r}. "
-            "Wrap a single column name in a list: expected_columns=[name]."
-        )
-    out = list(expected_columns)
-    for i, c in enumerate(out):
-        if not isinstance(c, str) or not c:
-            raise SqlIngestError(
-                f"expected_columns[{i}] must be non-empty str, got "
-                f"{type(c).__name__}={c!r}"
-            )
-    dupes = _sql_check.find_duplicates(out)
-    if dupes:
-        raise SqlIngestError(f"expected_columns contains duplicates: {dupes}")
-    return out
-
-
-def sql_query(
-    server: str,
-    database: str,
-    query: str,
-    *,
-    parameters: Sequence[str | None] | None = None,
-    driver: str = "ODBC Driver 17 for SQL Server",
-    port: int = 1433,
-    user: str | None = None,
-    password: str | None = None,
-    batch_size: int = 100_000,
-    login_timeout_sec: int = 30,
-    query_timeout_sec: int | None = None,
-    max_rows: int | None = None,
-    max_text_size: int | None = None,
-    max_binary_size: int | None = None,
-    encrypt: bool | None = None,
-    trust_server_certificate: bool | None = None,
-    authentication: str | None = None,
-    expected_columns: Sequence[str] | None = None,
-    allow_extra_columns: bool = False,
-    require_non_empty: bool = False,
-    require_tz_aware_timestamps: bool = False,
-    require_finite_numerics: bool = False,
-) -> pl.DataFrame:
-    """Run a SELECT against SQL Server, return a Polars DataFrame.
-
-    Parameters bind via ODBC (``parameters``); always prefer ``?``
-    placeholders over f-strings in ``query``. All failures surface as
-    ``SqlIngestError``. Result set materializes fully in memory; use
-    ``max_rows`` to abort runaway streams.
-
-    Opt-in flags:
-      * ``max_text_size`` / ``max_binary_size`` (bytes): size arrow_odbc
-        buffers for ``VARCHAR(MAX)`` / ``NVARCHAR(MAX)`` / ``VARBINARY(MAX)``.
-        Defaults are version-dependent and may silently truncate.
-      * ``encrypt`` / ``trust_server_certificate``: ``Encrypt`` is ALWAYS
-        emitted explicitly (Driver 17 default = ``no``, Driver 18 default
-        = ``yes``); we pin ``Encrypt=no`` when ``encrypt=None`` so a bare
-        driver-string swap doesn't silently enable TLS.
-      * ``authentication``: whitelist of ``Authentication=`` values.
-        Cred-required: ``SqlPassword``, ``ActiveDirectoryPassword``,
-        ``ActiveDirectoryServicePrincipal``. No-cred: ``ActiveDirectoryIntegrated``,
-        ``ActiveDirectoryMsi``, ``ActiveDirectoryDefault``,
-        ``ActiveDirectoryInteractive``. Case-sensitive PascalCase.
-      * ``require_tz_aware_timestamps`` / ``require_finite_numerics``:
-        enforce CLAUDE.md inbound contract items 2 and 4.
-
-    Cross-platform notes:
-      * Default auth (``user``/``password``/``authentication`` all None) =
-        ``Trusted_Connection=yes``: SSPI on Windows, Kerberos ticket on
-        Linux/macOS. Without a ticket on Linux, supply SQL or AAD creds.
-      * Linux/macOS require unixODBC (case-sensitive driver lookup); macOS
-        default iODBC is NOT supported. Driver 18 on Linux negotiates TLS
-        1.2+ only when ``encrypt=True``.
-      * ``ActiveDirectoryInteractive`` opens a browser — unsuitable for
-        servers / containers / cron / CI. ``ActiveDirectoryMsi`` requires
-        an Azure VM / App Service identity.
-      * ``server`` accepts ``tcp:HOST`` (we strip the prefix), ``np:`` /
-        ``lpc:`` / ``admin:`` (Windows-only, passed through), and
-        ``HOST\\INSTANCE`` named-instance syntax.
-      * ``login_timeout_sec`` / ``query_timeout_sec`` reject 0 (ODBC's
-        "no timeout" sentinel); pass a positive int or
-        ``query_timeout_sec=None`` to opt out explicitly.
-
-    arrow_odbc materializes only the FIRST result set from a statement;
-    fold multi-SELECT procedures into one SELECT or call separately.
-
-    Output contract: column order/names exactly as the server returned;
-    not sorted; no silent drops / dedupes / truncations. ``expected_columns``
-    is names-only — dtypes are not compared.
-
-    Thread-safe: each call holds its own cursor; concurrent calls from
-    independent threads are safe.
-    """
-    # --- input validation (inbound boundary) ---------------------------------
-    _sql_check.conn_token("server", server)
-    _sql_check.conn_token("database", database)
-    _sql_check.conn_token("driver", driver)
-
-    # Normalize known driver strings to fix unixODBC case-sensitivity on Linux
-    _known_drivers = {
-        "odbc driver 17 for sql server": "ODBC Driver 17 for SQL Server",
-        "odbc driver 18 for sql server": "ODBC Driver 18 for SQL Server",
-    }
-    driver_canon = _known_drivers.get(driver.lower(), driver)
-
-    if not isinstance(query, str) or not query.strip():
-        raise SqlIngestError("query must be a non-empty, non-whitespace str")
-    if "\x00" in query:
-        raise SqlIngestError("query contains a null byte")
-    if "\ufeff" in query:
-        # UTF-8 BOM (U+FEFF) leaks in from files saved as "UTF-8 with
-        # BOM" (common on Windows editors / older PowerShell Set-Content)
-        # and from naive concatenation of two such files. SQL Server
-        # sees the U+FEFF and fails with "incorrect syntax near ''".
-        # Using the "\ufeff" escape (rather than a literal invisible
-        # character in the source) keeps this check robust across
-        # editor re-encodings and source-file BOM handling. Reject
-        # anywhere in the query, not just at the start, since mid-string
-        # BOMs from file concatenation produce the same error.
-        raise SqlIngestError(
-            "query contains a UTF-8 BOM (U+FEFF); re-save the source "
-            "file as plain UTF-8, or strip via query.replace('\\ufeff', '')"
-        )
-
-    _sql_check.int_("port", port, minv=1, maxv=65_535)
-    _sql_check.int_("batch_size", batch_size, minv=1, maxv=_MAX_BATCH_SIZE)
-    # ``login_timeout_sec=0`` is the ODBC convention for "no timeout"
-    # — a connect that hangs forever is almost always a misconfig
-    # (firewall blackhole, wrong host) rather than something a caller
-    # actually wants. Force a positive bound; if "very long" is truly
-    # desired, ``_MAX_TIMEOUT_SEC`` (1 day) is the practical ceiling.
-    # Matches ``redshift_query``'s ``_validate_numeric_params``.
-    _sql_check.int_(
-        "login_timeout_sec", login_timeout_sec, minv=1, maxv=_MAX_TIMEOUT_SEC
-    )
-    # ``query_timeout_sec=None`` is the explicit "no timeout" path
-    # (allow_none=True). Reject the implicit ``=0`` ODBC sentinel so
-    # the caller has to choose deliberately between a positive cap
-    # and ``None``; mixing the two conventions hides intent at the
-    # call site. Matches ``redshift_query``'s ``_validate_numeric_params``.
-    _sql_check.int_(
-        "query_timeout_sec",
-        query_timeout_sec,
-        minv=1,
-        maxv=_MAX_TIMEOUT_SEC,
-        allow_none=True,
-    )
-    # ``max_rows=0`` is degenerate: any non-empty result aborts and an
-    # empty result trivially passes — equivalent to ``LIMIT 0`` on the
-    # server side, which is the right place to express it.  Force a
-    # positive cap so the parameter's intent ("abort runaway streaming
-    # above N rows") is unambiguous, matching ``redshift_query``.
-    max_rows_val = _sql_check.int_(
-        "max_rows", max_rows, minv=1, maxv=_MAX_ROWS_CAP, allow_none=True
-    )
-    _sql_check.int_(
-        "max_text_size",
-        max_text_size,
-        minv=1,
-        maxv=_MAX_VALUE_BYTES,
-        allow_none=True,
-    )
-    _sql_check.int_(
-        "max_binary_size",
-        max_binary_size,
-        minv=1,
-        maxv=_MAX_VALUE_BYTES,
-        allow_none=True,
-    )
-    _sql_check.bool_("require_non_empty", require_non_empty)
-    _sql_check.bool_("allow_extra_columns", allow_extra_columns)
-    _sql_check.bool_("require_tz_aware_timestamps", require_tz_aware_timestamps)
-    _sql_check.bool_("require_finite_numerics", require_finite_numerics)
-    _sql_check.optional_bool("encrypt", encrypt)
-    _sql_check.optional_bool("trust_server_certificate", trust_server_certificate)
-
-    _sql_check.optional_str("user", user)
-    _sql_check.optional_str("password", password)
-    if (user is None) != (password is None):
-        raise SqlIngestError(
-            "user and password must be supplied together, or both omitted "
-            "for trusted (SSPI on Windows / Kerberos on Linux & macOS) or "
-            "credential-less (AAD) auth"
-        )
-    if user is not None:
-        if not user:
-            raise SqlIngestError("user must be non-empty when provided")
-        _sql_check.no_control_chars("user", user)
-    if password is not None:
-        if not password:
-            # Empty password is almost always an unset-env-var typo; reject
-            # so the caller finds out at our boundary, not via a cryptic
-            # ODBC auth failure later.
-            raise SqlIngestError("password must be non-empty when provided")
-        _sql_check.no_control_chars("password", password)
-        # ``_redact_secrets`` skips substrings shorter than
-        # ``_MIN_SECRET_REDACTION_LEN`` to avoid destroying error
-        # readability. Without a matching boundary reject, a caller with
-        # e.g. ``password="abc"`` (3 chars) would have their password
-        # slip through both the redaction helper (skipped) AND appear
-        # verbatim in any driver error that echoes the value. Reject at
-        # the boundary so the two thresholds stay coherent. Length, not
-        # entropy, is enforced here — entropy is a caller / IAM-policy
-        # concern.
-        if len(password) < _MIN_SECRET_REDACTION_LEN:
-            raise SqlIngestError(
-                f"password must be at least {_MIN_SECRET_REDACTION_LEN} "
-                "characters; shorter values cannot be safely redacted "
-                "from driver error messages and would leak if the "
-                "connection string or driver kwargs are echoed."
-            )
-
-    _sql_check.optional_str("authentication", authentication)
-    if authentication is not None:
-        if authentication not in _SQL_AUTHENTICATION_VALUES:
-            raise SqlIngestError(
-                f"authentication={authentication!r} not in whitelist; "
-                f"allowed: {sorted(_SQL_AUTHENTICATION_VALUES)}"
-            )
-        if authentication in _SQL_AUTH_REQUIRES_CREDS and user is None:
-            raise SqlIngestError(
-                f"authentication={authentication!r} requires user and password"
-            )
-        if authentication in _SQL_AUTH_NO_CREDS and user is not None:
-            raise SqlIngestError(
-                f"authentication={authentication!r} must not be combined "
-                "with user/password"
-            )
-
-    params = _sql_validate_parameters(parameters)
-    expected = _sql_validate_expected_columns(expected_columns)
-    server_canon, emit_server_verbatim = _sql_normalize_server(server)
-
-    # --- build connection string ---------------------------------------------
-    # Trusted auth only kicks in when the caller supplied neither SQL creds
-    # nor an explicit `authentication` mode. On Linux this path requires a
-    # Kerberos ticket (see the Cross-platform note in the docstring).
-    use_trusted = user is None and authentication is None
-    if emit_server_verbatim:
-        # Named instance (HOST\\INSTANCE) or Windows-only protocol prefix
-        # (np:/lpc:/admin:). Both forms must not carry an auto-added
-        # `tcp:` or `,PORT`.
-        server_segment = f"SERVER={server_canon}"
-    else:
-        server_segment = f"SERVER=tcp:{server_canon},{port}"
-    # Brace-quote DATABASE for symmetry with DRIVER so values containing
-    # "=" or other ODBC-reserved punctuation can never be mis-parsed by
-    # downstream tools (some driver managers, proxies, and monitoring
-    # probes tokenize loosely).  `_sql_check.conn_token` already rejects `{`,
-    # `}`, `;`, NUL, CR, LF in `database`, so brace-quoting is closed-form
-    # safe — the value can never contain the closing `}` that would break
-    # the quoting.
-    parts = [
-        f"DRIVER={{{driver_canon}}}",
-        server_segment,
-        f"DATABASE={{{database}}}",
-    ]
-    if use_trusted:
-        parts.append("Trusted_Connection=yes")
-    if authentication is not None:
-        # Value is whitelist-constrained above, so safe to interpolate.
-        parts.append(f"Authentication={authentication}")
-    # Pin Encrypt explicitly, independent of driver version. ODBC Driver
-    # 18 flipped the implicit default from `no` (Driver 17) to `yes`, so
-    # an unspecified `encrypt` would silently change TLS semantics across
-    # a bare driver-string swap. Defaulting to `no` here preserves Driver
-    # 17's legacy behavior so callers who only change the driver string
-    # continue to connect against the same server with the same semantics.
-    effective_encrypt = encrypt if encrypt is not None else False
-    parts.append(f"Encrypt={'yes' if effective_encrypt else 'no'}")
-    if trust_server_certificate is not None:
-        parts.append(
-            f"TrustServerCertificate={'yes' if trust_server_certificate else 'no'}"
-        )
-    conn_str = ";".join(parts) + ";"
-
-    # --- open reader ---------------------------------------------------------
-    # Some ODBC drivers echo the connection string in error text; redact
-    # via ``secrets`` and chain via ``from None`` so the unredacted cause
-    # doesn't appear in the default traceback. ``del reader`` triggers
-    # arrow_odbc's Rust Drop in CPython, closing the server-side cursor
-    # synchronously before any exception propagates.
-    secrets = tuple(s for s in (password,) if s)
-    try:
-        reader = read_arrow_batches_from_odbc(
-            connection_string=conn_str,
-            query=query,
-            batch_size=batch_size,
-            user=user,
-            password=password,
-            parameters=params,
-            login_timeout_sec=login_timeout_sec,
-            query_timeout_sec=query_timeout_sec,
-            max_text_size=max_text_size,
-            max_binary_size=max_binary_size,
-        )
-    except TypeError as exc:
-        # arrow_odbc kw-arg evolution; TypeError doesn't echo conn_str.
-        raise SqlIngestError(
-            f"arrow_odbc rejected a keyword argument "
-            f"(likely a version mismatch): "
-            f"{_redact_secrets(str(exc), secrets)}"
-        ) from exc
-    except Exception as exc:  # arrow_odbc raises various native errors
-        raise SqlIngestError(
-            f"failed to open ODBC reader against {server_canon}/{database}: "
-            f"{_redact_secrets(str(exc), secrets)}"
-        ) from None
-
-    batches: list[pa.RecordBatch] = []
-    total_rows = 0
-    over_cap = False
-    try:
-        if reader is None:
-            raise SqlIngestError(
-                "query produced no result set; sql_query expects a SELECT"
-            )
-        try:
-            schema = reader.schema
-        except Exception as exc:
-            raise SqlIngestError(
-                f"failed to read arrow schema from ODBC result: "
-                f"{_redact_secrets(str(exc), secrets)}"
-            ) from None
-        if schema is None:
-            raise SqlIngestError("ODBC result reported a null arrow schema")
-
-        schema_names: list[str] = list(schema.names)
-        schema_dupes = _sql_check.find_duplicates(schema_names)
-        if schema_dupes:
-            raise SqlIngestError(
-                f"duplicate column names in server result set: "
-                f"{schema_dupes}"
-            )
-
-        # Manual iteration so max_rows aborts before we balloon memory.
-        try:
-            for batch in reader:
-                batches.append(batch)
-                total_rows += batch.num_rows
-                if max_rows_val is not None and total_rows > max_rows_val:
-                    over_cap = True
-                    break
-        except Exception as exc:
-            batches.clear()
-            raise SqlIngestError(
-                f"failed while streaming batches from "
-                f"{server_canon}/{database}: "
-                f"{_redact_secrets(str(exc), secrets)}"
-            ) from None
-
-        if over_cap:
-            if max_rows_val is None:
-                raise SqlIngestError(
-                    "invariant violated: over_cap=True but max_rows_val is None"
-                )
-            batches.clear()
-            raise SqlIngestError(
-                f"result exceeded max_rows={max_rows_val}: streamed "
-                f"{total_rows} rows before abort against "
-                f"{server_canon}/{database}"
-            )
-    finally:
-        del reader
-
-    try:
-        table = pa.Table.from_batches(batches=batches, schema=schema)
-    except Exception as exc:
-        # Release the accumulated batches before propagating; the Table
-        # wasn't built, so they'd otherwise linger until GC.
-        batches.clear()
-        raise SqlIngestError(f"failed to assemble arrow table: {exc}") from exc
-
-    if table.num_rows != total_rows:
-        raise SqlIngestError(
-            "row-count invariant violated assembling arrow Table: "
-            f"sum(batch.num_rows)={total_rows} vs table.num_rows="
-            f"{table.num_rows}"
-        )
-
-    # Release per-batch Python refs. The Table keeps its own zero-copy
-    # references to the underlying buffers.
-    batches.clear()
-
-    # pl.from_arrow(Table) returns DataFrame; the Series branch exists for
-    # Array/ChunkedArray inputs. Wrap defensively: recent Polars rejects
-    # tables with duplicate arrow field names, which we'd rather surface
-    # as SqlIngestError than as a raw pl.exceptions error.
-    try:
-        df_or_series = pl.from_arrow(table)
-    except Exception as exc:
-        raise SqlIngestError(
-            f"failed to convert arrow Table to Polars DataFrame: {exc}"
-        ) from exc
-    if not isinstance(df_or_series, pl.DataFrame):
-        raise SqlIngestError(
-            f"expected pl.DataFrame from arrow Table, got "
-            f"{type(df_or_series).__name__}"
-        )
-    df = df_or_series
-
-    # --- schema & row-count preservation across arrow -> polars --------------
-    cols = list(df.columns)
-    if cols != schema_names:
-        raise SqlIngestError(
-            "schema mismatch between arrow Table and Polars DataFrame "
-            f"(arrow={schema_names} polars={cols}); "
-            "pl.from_arrow must not reorder or rename columns"
-        )
-    if df.height != total_rows:
-        raise SqlIngestError(
-            "row-count invariant violated in arrow->polars conversion: "
-            f"expected {total_rows}, got {df.height}"
-        )
-
-    # --- post-load caller-facing checks --------------------------------------
-    if expected is not None:
-        missing = [c for c in expected if c not in cols]
-        extra = [c for c in cols if c not in expected]
-        if missing or (extra and not allow_extra_columns):
-            err_msg = f"schema mismatch: missing={missing}"
-            if not allow_extra_columns:
-                err_msg += f" extra={extra}"
-            err_msg += f" got={cols}"
-            raise SqlIngestError(err_msg)
-
-    if require_tz_aware_timestamps:
-        naive: list[str] = []
-        for name, dtype in df.schema.items():
-            if isinstance(dtype, pl.Datetime) and _datetime_tz(dtype) is None:
-                naive.append(name)
-        if naive:
-            raise SqlIngestError(
-                "require_tz_aware_timestamps=True but columns lack tz: "
-                f"{naive}"
-            )
-
-    if require_non_empty and df.height == 0:
-        raise SqlIngestError(
-            f"query returned 0 rows against {server_canon}/{database} "
-            "(require_non_empty=True)"
-        )
-
-    _sql_check.finite_numerics(df, require=require_finite_numerics)
-
-    return df
 
 #################################################################################################
 # Function for reading Amazon Redshift data into a Polars DataFrame, with robust input validation and error handling.
@@ -3271,8 +2504,8 @@ class _ArrowBatchReader(Protocol):
 # Boundary validators bound to ``RedshiftIngestError``.  See
 # ``_BoundaryChecker`` at module top — one implementation, parameterized
 # on the exception class.  ``_CONN_STR_FORBIDDEN`` / ``_MAX_BATCH_SIZE`` /
-# ``_MAX_TIMEOUT_SEC`` / ``_MAX_ROWS_CAP`` / ``_MAX_VALUE_BYTES`` are also
-# defined once at module top and shared with sql_query.
+# ``_MAX_TIMEOUT_SEC`` / ``_MAX_ROWS_CAP`` / ``_MAX_VALUE_BYTES`` are
+# defined once at module top.
 _rs_check = _BoundaryChecker(RedshiftIngestError)
 
 # Characters forbidden inside an individual DbGroups entry. We join groups
@@ -3455,8 +2688,7 @@ def _validate_conn_string_identifier_fields(
     db_user: str | None,
 ) -> None:
     """Reject ``=`` and ASCII whitespace in fields that interpolate as
-    ODBC ``KEY=<val>`` segments — closes the KEY=VALUE-injection path
-    on top of ``_CONN_STR_FORBIDDEN`` (which blocks ``;{}\\0\\n\\r``)."""
+    ODBC ``KEY=<val>`` segments."""
     forbidden = ("=", " ", "\t")
     for name, value in (
         ("aws_profile", aws_profile),
@@ -3662,11 +2894,15 @@ def _validate_iam_auth(
 def _endpoint_segment(
     *, driver: str, host: str, port: int, database: str
 ) -> list[str]:
+    # Brace-quote DRIVER / SERVER / DATABASE so an unusual char inside
+    # the value (e.g. an `=` in a CNAME alias) cannot be re-parsed as a
+    # KEY=VALUE boundary by a permissive driver. `_CONN_STR_FORBIDDEN`
+    # already rejects `}`, so the closing brace is closed-form safe.
     return [
         f"DRIVER={{{driver}}}",
-        f"SERVER={host}",
+        f"SERVER={{{host}}}",
         f"PORT={port}",
-        f"DATABASE={database}",
+        f"DATABASE={{{database}}}",
     ]
 
 
@@ -3927,11 +3163,21 @@ def _arrow_table_to_polars(
     """Convert; assert column-order and row-count preserved across the
     arrow→polars boundary."""
     try:
-        df = cast(pl.DataFrame, pl.from_arrow(table))
+        df_or_series = pl.from_arrow(table)
     except Exception as exc:
         raise RedshiftIngestError(
             f"failed to convert arrow Table to Polars DataFrame: {exc}"
         ) from exc
+    # ``pl.from_arrow`` returns DataFrame for Table input; the Series
+    # branch exists for Array/ChunkedArray. Guard at runtime — a static
+    # ``cast`` would let an API drift slip through as an opaque
+    # AttributeError on the next ``df.columns`` access.
+    if not isinstance(df_or_series, pl.DataFrame):
+        raise RedshiftIngestError(
+            f"expected pl.DataFrame from arrow Table, got "
+            f"{type(df_or_series).__name__}"
+        )
+    df = df_or_series
 
     cols = list(df.columns)
     if cols != schema_names:
@@ -4060,7 +3306,9 @@ def redshift_query(
 
     Parameters are bound via ODBC (``parameters``), never via string
     formatting, so callers should always prefer ``?`` placeholders over
-    f-strings in ``query``. All failures surface as ``RedshiftIngestError``.
+    f-strings in ``query``. All boundary-contract failures surface as
+    ``RedshiftIngestError``; ``MemoryError`` and signal exceptions
+    (``KeyboardInterrupt`` / ``SystemExit``) propagate unwrapped.
 
     Memory: the full result set is materialized in memory. For multi-GB
     queries, shrink the server-side projection or filter before calling,

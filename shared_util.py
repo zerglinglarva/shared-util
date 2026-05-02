@@ -32,6 +32,7 @@ from matplotlib.figure import Figure
 __all__ = [
     "parse_yyyymmdd",
     "compute_lookback_startdate",
+    "resolve_runtime_params",
     "compute_mtd_date_range",
     "lazy_parquet",
     "winsorized_rolling_stats",
@@ -432,6 +433,115 @@ def compute_lookback_startdate(
             f"[{earliest}, {startdate - datetime.timedelta(days=1)}]"
         )
     return cast(datetime.date, sessions_before[-lookback_trading_days])
+
+
+#################################################################################################
+# resolve_runtime_params — apply defaults + validate runtime params for EDA-style scripts
+
+def resolve_runtime_params(
+    startdate: datetime.date | None,
+    enddate: datetime.date | None,
+    write_mode: str | None,
+    input_mode: str | None,
+    *,
+    default_startdate: datetime.date,
+    default_enddate: datetime.date,
+    default_write_mode: str,
+    default_input_mode: str,
+    research_folder: str,
+    production_folder: str,
+) -> tuple[datetime.date, datetime.date, str, str]:
+    """Apply default fallbacks; validate write_mode, write_directory, date range.
+
+    Centralizes the resolution rules used by the four invocation modes (CLI
+    no-args, CLI with-args, function no-args, function with-args) of
+    EDA-style entry-point scripts. All defaults and the
+    research/production folder paths are passed in by the caller so this
+    helper has no module-level coupling. As a public shared-util boundary,
+    caller-supplied defaults and folder paths are themselves validated up
+    front so that misattributed error messages can never blame a runtime
+    input for a bad default.
+    """
+    # --- Validate caller-supplied defaults (boundary check) ---------------
+    _VALID_WRITE_MODES = {"research", "production"}
+    _VALID_INPUT_MODES = {"hot", "cold"}
+    if default_write_mode not in _VALID_WRITE_MODES:
+        raise ValueError(
+            f"Invalid default_write_mode: {default_write_mode!r}. "
+            f"Options are {sorted(_VALID_WRITE_MODES)} (exact match)"
+        )
+    if default_input_mode not in _VALID_INPUT_MODES:
+        raise ValueError(
+            f"Invalid default_input_mode: {default_input_mode!r}. "
+            f"Options are {sorted(_VALID_INPUT_MODES)} (exact match)"
+        )
+    for _name, _val in (("research_folder", research_folder), ("production_folder", production_folder)):
+        if not isinstance(_val, str) or not _val.strip():
+            raise ValueError(f"{_name} must be a non-empty string; got {_val!r}")
+        if not Path(_val).is_absolute():
+            raise ValueError(f"{_name} must be an absolute path; got {_val!r}")
+
+    # --- Narrow datetime → date at entry (CLAUDE.md boundary rule) --------
+    # datetime.datetime is a subclass of datetime.date; normalize so downstream
+    # date arithmetic doesn't silently mix the two. Applied symmetrically to
+    # caller-supplied defaults AND runtime inputs, otherwise a datetime-typed
+    # default leaks through into the return tuple declared as date.
+    if isinstance(default_startdate, datetime.datetime):
+        default_startdate = default_startdate.date()
+    if isinstance(default_enddate, datetime.datetime):
+        default_enddate = default_enddate.date()
+    if not isinstance(default_startdate, datetime.date):
+        raise TypeError(f"default_startdate must be datetime.date; got {type(default_startdate).__name__}")
+    if not isinstance(default_enddate, datetime.date):
+        raise TypeError(f"default_enddate must be datetime.date; got {type(default_enddate).__name__}")
+    if startdate is not None and isinstance(startdate, datetime.datetime):
+        startdate = startdate.date()
+    if enddate is not None and isinstance(enddate, datetime.datetime):
+        enddate = enddate.date()
+    if startdate is not None and not isinstance(startdate, datetime.date):
+        raise TypeError(f"startdate must be datetime.date or None; got {type(startdate).__name__}")
+    if enddate is not None and not isinstance(enddate, datetime.date):
+        raise TypeError(f"enddate must be datetime.date or None; got {type(enddate).__name__}")
+
+    if default_startdate > default_enddate:
+        raise ValueError(
+            f"default_startdate ({default_startdate}) must be on or before "
+            f"default_enddate ({default_enddate})"
+        )
+
+    # --- Apply defaults ---------------------------------------------------
+    startdate = startdate if startdate is not None else default_startdate
+    enddate = enddate if enddate is not None else default_enddate
+
+    if startdate > enddate:
+        raise ValueError(
+            f"startdate ({startdate}) must be on or before enddate ({enddate})"
+        )
+
+    if write_mode is None:
+        write_mode = default_write_mode
+    if input_mode is None:
+        input_mode = default_input_mode
+
+    if write_mode == "research":
+        write_directory = research_folder
+    elif write_mode == "production":
+        write_directory = production_folder
+    else:
+        raise ValueError(
+            f"Invalid value for write_mode: {write_mode!r}. Options are 'research' or 'production' (exact match; no whitespace or case normalization)"
+        )
+
+    if input_mode not in _VALID_INPUT_MODES:
+        raise ValueError(
+            f"Invalid value for input_mode: {input_mode!r}. Options are 'hot' or 'cold' (exact match; no whitespace or case normalization)"
+        )
+
+    write_directory = str(Path(write_directory).resolve())
+    if not Path(write_directory).is_dir():
+        raise FileNotFoundError(f"Write directory does not exist: {write_directory}")
+
+    return startdate, enddate, write_directory, input_mode
 
 
 #################################################################################################

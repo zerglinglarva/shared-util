@@ -1745,10 +1745,10 @@ def save_matplotlib_charts_as_html(
     folder_path = _resolve_folder_path(write_directory, subfolder)
 
     # ── Step 3: Build paths and check lengths ───────────────────────────
-    # Timestamp (YYYYMMDDHHMM, _REPORT_TZ) baked into the filename so repeat
+    # Timestamp (YYYY-MMDD-HHMM, _REPORT_TZ) baked into the filename so repeat
     # runs do not overwrite prior reports; same TZ as the "Generated:" header
     # below for cross-reference.
-    save_ts = datetime.datetime.now(tz=_REPORT_TZ).strftime("%Y%m%d%H%M")
+    save_ts = datetime.datetime.now(tz=_REPORT_TZ).strftime("%Y-%m%d-%H%M")
     file_name = f"{file_name_prefix}-{save_ts}.html"
     file_path = str(Path(folder_path) / file_name)
     tmp_path = f"{file_path}.{uuid.uuid4().hex[:8]}.tmp"
@@ -1764,7 +1764,7 @@ def save_matplotlib_charts_as_html(
     # bound.  Cleanup is best-effort; any failure is silently suppressed
     # inside the helper.
     # 24h threshold for orphaned .tmp; 92d threshold for finished
-    # <prefix>-YYYYMMDDHHMM.html outputs (each save now produces a
+    # <prefix>-YYYY-MMDD-HHMM.html outputs (each save now produces a
     # timestamped file rather than overwriting, so prune by age here).
     _cleanup_stale_files(
         folder_path,
@@ -1936,14 +1936,14 @@ def _cleanup_stale_files(
     html_output_max_age_seconds: int | None = None,
 ) -> None:
     """Remove orphaned .tmp / .time_probe_ files older than max_age_seconds,
-    and optionally finished ``<prefix>-YYYYMMDDHHMM.html`` outputs older
+    and optionally finished ``<prefix>-YYYY-MMDD-HHMM.html`` outputs older
     than html_output_max_age_seconds (opt-in; ``None`` skips that sweep).
 
     Patterns recognized:
       * save_results           → ``<prefix>.parquet.<uuid8>.tmp``
                               or ``<prefix>-YYYYMM-YYYYMM.parquet.<uuid8>.tmp``
-      * save_matplotlib_charts → ``<prefix>-YYYYMMDDHHMM.html.<uuid8>.tmp``  (orphan)
-                              or ``<prefix>-YYYYMMDDHHMM.html``              (finished, opt-in)
+      * save_matplotlib_charts → ``<prefix>-YYYY-MMDD-HHMM.html.<uuid8>.tmp``  (orphan)
+                              or ``<prefix>-YYYY-MMDD-HHMM.html``              (finished, opt-in)
 
     Uses a probe file for the NAS server's current time (avoids client-NAS
     clock drift). If the probe fails, cleanup is aborted (better than
@@ -1987,14 +1987,14 @@ def _cleanup_stale_files(
             if not is_stale_tmp and f_cf.endswith(".tmp") and ".html." in f_cf:
                 base_name_cf = f_cf.rsplit(".html.", 1)[0]
                 # Match save_matplotlib_charts_as_html naming:
-                # ``<prefix>-YYYYMMDDHHMM.html.<uuid8>.tmp``.
+                # ``<prefix>-YYYY-MMDD-HHMM.html.<uuid8>.tmp``.
                 if base_name_cf.startswith(f"{prefix_cf}-"):
                     ts_part = base_name_cf[len(prefix_cf) + 1 :]
-                    if re.match(r"^\d{12}$", ts_part):
+                    if re.match(r"^\d{4}-\d{4}-\d{4}$", ts_part):
                         is_stale_tmp = True
             is_orphaned_probe = f.startswith(".time_probe_")
             # Finished HTML outputs from save_matplotlib_charts_as_html
-            # (``<prefix>-YYYYMMDDHHMM.html``).  Opt-in via
+            # (``<prefix>-YYYY-MMDD-HHMM.html``).  Opt-in via
             # html_output_max_age_seconds — ``None`` skips this sweep so the
             # parquet caller never accidentally deletes chart artifacts.
             is_stale_html_output = False
@@ -2002,7 +2002,7 @@ def _cleanup_stale_files(
                 base_name_cf = f_cf[: -len(".html")]
                 if base_name_cf.startswith(f"{prefix_cf}-"):
                     ts_part = base_name_cf[len(prefix_cf) + 1 :]
-                    if re.match(r"^\d{12}$", ts_part):
+                    if re.match(r"^\d{4}-\d{4}-\d{4}$", ts_part):
                         is_stale_html_output = True
             if not (is_stale_tmp or is_orphaned_probe or is_stale_html_output):
                 continue
